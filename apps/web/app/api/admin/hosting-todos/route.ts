@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { getAdminFromRequest } from '@/lib/admin-session';
-import { createHostingTodo, listHostingLeaveDates, listHostingTodos } from '@/lib/db';
+import { createHostingTodo, getSiteSetting, listHostingLeaveDates, listHostingTodos } from '@/lib/db';
+import { REST_SETTING_KEY, parseWeeklyRestDays } from '@/lib/hosting-rest-days';
 import { analyzeRoleScheduleConflict } from '@/lib/hosting-todo-schedule';
 import { DEFAULT_HOST_TYPE, parseHostType } from '@/lib/hosting-types';
 
@@ -29,7 +30,9 @@ export async function GET(req: NextRequest) {
     if (!session) return NextResponse.json({ error: '未登录' }, { status: 401 });
     const rows = await listHostingTodos();
     const leaveDates = await listHostingLeaveDates();
-    return NextResponse.json({ data: rows.map(mapRow), leaveDates });
+    // 返回规则本体而非当周展开结果：看板需要跨周判断（延后计算会越过展示周）
+    const restDays = parseWeeklyRestDays(await getSiteSetting(REST_SETTING_KEY));
+    return NextResponse.json({ data: rows.map(mapRow), leaveDates, restDays });
   } catch (e) {
     console.error('[hosting-todos GET]', e);
     const msg = e instanceof Error ? e.message : String(e);

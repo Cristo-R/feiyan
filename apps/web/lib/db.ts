@@ -708,6 +708,79 @@ export async function moveHostingTodoToDate(id: number, newDate: string): Promis
   return true;
 }
 
+/**
+ * 批量改期（队列延后）：整条时间线重排，部分成功会留下错乱的排期，故必须原子。
+ * 同一目标日内按 moves 给出的顺序重新编号 sort_order。
+ */
+export async function bulkMoveHostingTodos(moves: { id: number; toDate: string }[]): Promise<boolean> {
+  if (moves.length === 0) return true;
+  const db = await getHostingTodosDb();
+  const now = Date.now();
+
+  db.run('BEGIN IMMEDIATE');
+  try {
+    // 改期前的位置快照：重排时要靠它还原时间线先后，不能用改期后的 sort_order
+    const before = new Map<number, { date: string; sort: number }>();
+    const snap = db.prepare('SELECT id, todo_date, sort_order FROM hosting_todos');
+    while (snap.step()) {
+      const o = snap.getAsObject() as Record<string, unknown>;
+      before.set(Number(o.id), { date: String(o.todo_date ?? ''), sort: Number(o.sort_order ?? 0) });
+    }
+    snap.free();
+
+    for (const mv of moves) {
+      if (!Number.isFinite(mv.id) || mv.id <= 0) throw new Error('无效 id');
+      if (!before.has(mv.id)) throw new Error(`条目 ${mv.id} 不存在`);
+      db.run('UPDATE hosting_todos SET todo_date = ?, updated_at = ? WHERE id = ?', [mv.toDate, now, mv.id]);
+    }
+
+    /*
+     * 受影响日期内重排 sort_order。
+     * 按改期「前」的 (日期, sort_order, id) 排序 —— 即全局时间线顺序。
+     * 若按改期后的 sort_order 排，来自不同源日期的条目并到同一天时会被颠倒：
+     * A(05-10, sort=9) 与 B(05-11, sort=0) 同时落到 05-11，时间线上 A 在 B 前，
+     * 但按旧 sort_order 排会得到 B, A。
+     */
+    const touched = new Set(moves.map(m => m.toDate));
+    for (const date of touched) {
+      const stmt = db.prepare('SELECT id FROM hosting_todos WHERE todo_date = ?');
+      stmt.bind([date]);
+      const ids: number[] = [];
+      while (stmt.step()) {
+        const o = stmt.getAsObject() as Record<string, unknown>;
+        ids.push(Number(o.id));
+      }
+      stmt.free();
+      ids.sort((a, b) => {
+        const pa = before.get(a);
+        const pb = before.get(b);
+        if (!pa || !pb) return a - b;
+        return pa.date.localeCompare(pb.date) || pa.sort - pb.sort || a - b;
+      });
+      for (let i = 0; i < ids.length; i++) {
+        db.run('UPDATE hosting_todos SET sort_order = ? WHERE id = ?', [i, ids[i]]);
+      }
+    }
+
+    db.run('COMMIT');
+    persistDb(db);
+    return true;
+  } catch (e) {
+    console.error('[bulkMoveHostingTodos]', e);
+    try {
+      db.run('ROLLBACK');
+    } catch (rollbackErr) {
+      /*
+       * ROLLBACK 失败：这个 Database 句柄是进程级共享的，半应用的 UPDATE 会留在内存里，
+       * 之后任何 handler 的 persistDb 都会把它写进文件。重新从磁盘加载以丢弃脏状态。
+       */
+      console.error('[bulkMoveHostingTodos] ROLLBACK 失败，丢弃内存库并从磁盘重载', rollbackErr);
+      globalThis.__feiyan_db_open = undefined;
+    }
+    return false;
+  }
+}
+
 export type CooperationCaseRow = {
   id: number;
   title: string;

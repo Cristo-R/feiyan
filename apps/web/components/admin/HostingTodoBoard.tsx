@@ -1,12 +1,26 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchAdminCaptainsList } from '@/lib/admin-captains-list';
 import { T9_GROUP_KEYS, T9_GROUP_LABEL, preloadPinyinPro, t9GroupKeyForDisplayName } from '@/lib/captain-t9-group';
 import type { CaptainApiDto } from '@/lib/captain-dto';
 import { captainAvatarImgReferrerPolicy, captainAvatarImgSrc } from '@/lib/captain-avatar-placeholder';
 import { captainPoolDisplayLine, captainScheduleName } from '@/lib/captain-schedule-name';
 import { addDaysIso, analyzeRoleScheduleConflict } from '@/lib/hosting-todo-schedule';
+import {
+  WEEKDAY_OPTIONS,
+  formatRestDaysLabel,
+  isWeeklyRestDate,
+  parseWeeklyRestDays,
+  type IsoWeekday,
+} from '@/lib/hosting-rest-days';
+import {
+  MAX_DEFER_N,
+  planDeferByDays,
+  planDeferByOccurrences,
+  type DeferPlan,
+  type DeferRow,
+} from '@/lib/hosting-defer';
 import {
   isoDatesCurrentWeek,
   mondayIsoOfWeekContaining,
@@ -151,16 +165,65 @@ function toSchedulingRows(list: HostingTodoDto[]) {
 const MIME_HOSTING = 'application/x-feiyan-hosting';
 const MIME_CAPTAIN = 'application/x-feiyan-hosting-captain';
 
+/** 拖入固休日的确认：「今日不再提醒」存当天日期，跨日天然失效 */
+const REST_SUPPRESS_KEY = 'feiyan.restDropSuppressedOn';
+
+function readRestDropSuppressed(todayIso: string): boolean {
+  try {
+    return window.sessionStorage.getItem(REST_SUPPRESS_KEY) === todayIso;
+  } catch {
+    // 隐私模式等场景会抛；读不到就当未抑制，仍然弹窗（安全的默认）
+    return false;
+  }
+}
+
+function writeRestDropSuppressed(todayIso: string) {
+  try {
+    window.sessionStorage.setItem(REST_SUPPRESS_KEY, todayIso);
+  } catch {
+    /* 存不下就只在本次会话内存里生效 */
+  }
+}
+
+/** 落到固休日的待确认操作：新建（舰长池拖入）或改期（条目跨日拖动） */
+type PendingRestDrop =
+  | { kind: 'create'; targetDate: string; roleName: string; captainId?: number }
+  | { kind: 'move'; targetDate: string; id: number; roleName: string };
+
+/** 右键菜单：锚点条目 + 视口坐标 */
+type QueueMenu = { item: HostingTodoDto; x: number; y: number };
+
+/** 延后预览：算好的方案 + 用于文案的维度描述 */
+type DeferPreview = { plan: DeferPlan; anchorName: string; label: string };
+
+function toDeferRows(list: HostingTodoDto[]): DeferRow[] {
+  return list.map(r => ({ id: r.id, todoDate: r.todoDate, roleName: r.roleName, sortOrder: r.sortOrder }));
+}
+
 export default function HostingTodoBoard() {
   const [rows, setRows] = useState<HostingTodoDto[]>([]);
   const [captains, setCaptains] = useState<CaptainApiDto[]>([]);
   const [currentGuardUids, setCurrentGuardUids] = useState<Set<string>>(new Set());
   const [expiredCaptainsInFuture, setExpiredCaptainsInFuture] = useState<Set<string>>(new Set());
   const [suppressedExpiredWarnings, setSuppressedExpiredWarnings] = useState<Set<string>>(new Set());
+  /**
+   * load 只读该集合、不应因它变化而重建：
+   * 否则点「不再提示」会改变 load 的标识，进而触发 [load] 这个 effect 重新全量拉取，
+   * 列表随之闪一下。用 ref 持有最新值，把它从 load 的依赖里摘掉。
+   */
+  const suppressedRef = useRef(suppressedExpiredWarnings);
+  useEffect(() => {
+    suppressedRef.current = suppressedExpiredWarnings;
+  }, [suppressedExpiredWarnings]);
   const [showExpiredWarning, setShowExpiredWarning] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  /**
+   * 正在操作的条目 id。只让该条目变暗，而不是整列表跟着 busy 闪一下；
+   * 改托管类型 / 勾卡任务这类单条操作，视觉上应只影响它自己。
+   */
+  const [busyItemId, setBusyItemId] = useState<number | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hoverDate, setHoverDate] = useState<string | null>(null);
@@ -168,6 +231,15 @@ export default function HostingTodoBoard() {
   const [captainFilter, setCaptainFilter] = useState('');
   const [leaveDates, setLeaveDates] = useState<string[]>([]);
   const [leaveDialogDate, setLeaveDialogDate] = useState<string | null>(null);
+  /** 每周固休规则（1=周一 … 7=周日） */
+  const [restDays, setRestDays] = useState<IsoWeekday[]>([]);
+  const [restPanelOpen, setRestPanelOpen] = useState(false);
+  /** 固休面板内的草稿，保存后才写回 restDays */
+  const [restDraft, setRestDraft] = useState<IsoWeekday[]>([]);
+  const [pendingRestDrop, setPendingRestDrop] = useState<PendingRestDrop | null>(null);
+  const [restDropSuppress, setRestDropSuppress] = useState(false);
+  const [queueMenu, setQueueMenu] = useState<QueueMenu | null>(null);
+  const [deferPreview, setDeferPreview] = useState<DeferPreview | null>(null);
   const [scheduleOpen, setScheduleOpen] = useState(true);
   const [poolOpen, setPoolOpen] = useState(true);
   /** 当前展示周的周一（ISO 日期）；默认"今天所在周" */
@@ -203,12 +275,18 @@ export default function HostingTodoBoard() {
         fetch('/api/admin/captains/current-guard-list', { credentials: 'include' }).then(res => res.ok ? res.json() : null)
       ]);
 
-      const todoBody = (await todoRes.json()) as { data?: HostingTodoDto[]; leaveDates?: string[]; error?: string };
+      const todoBody = (await todoRes.json()) as {
+        data?: HostingTodoDto[];
+        leaveDates?: string[];
+        restDays?: unknown;
+        error?: string;
+      };
       if (!todoRes.ok) {
         setError(todoBody.error || '任务板加载失败');
         setRows([]);
         setLeaveDates([]);
       } else {
+        setRestDays(parseWeeklyRestDays(todoBody.restDays));
         const todos = Array.isArray(todoBody.data)
           ? todoBody.data.map(normalizeHostingTodo).filter((r): r is HostingTodoDto => r != null)
           : [];
@@ -255,7 +333,7 @@ export default function HostingTodoBoard() {
           setExpiredCaptainsInFuture(expiredInFuture);
 
           // 如果有非舰长且未被抑制，显示警告
-          const unsuppressed = Array.from(expiredInFuture).filter(name => !suppressedExpiredWarnings.has(name));
+          const unsuppressed = Array.from(expiredInFuture).filter(name => !suppressedRef.current.has(name));
           if (unsuppressed.length > 0) {
             setShowExpiredWarning(true);
           }
@@ -269,7 +347,7 @@ export default function HostingTodoBoard() {
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [suppressedExpiredWarnings]);
+  }, []);
 
   const submitLeave = useCallback(async (date: string, onLeave: boolean): Promise<boolean> => {
     setBusy(true);
@@ -321,6 +399,40 @@ export default function HostingTodoBoard() {
     return () => window.removeEventListener('keydown', onKey);
   }, [leaveDialogDate]);
 
+  /** 右键菜单：Escape / 点击菜单外 / 滚动 均关闭 */
+  useEffect(() => {
+    if (!queueMenu) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setQueueMenu(null);
+    }
+    function onDown(e: MouseEvent) {
+      const el = e.target as HTMLElement | null;
+      if (el?.closest('[data-queue-menu]')) return;
+      setQueueMenu(null);
+    }
+    const close = () => setQueueMenu(null);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [queueMenu]);
+
+  useEffect(() => {
+    if (!restPanelOpen && !pendingRestDrop && !deferPreview) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== 'Escape') return;
+      setRestPanelOpen(false);
+      setPendingRestDrop(null);
+      setDeferPreview(null);
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [restPanelOpen, pendingRestDrop, deferPreview]);
+
   const byDate = useMemo(() => {
     const m = new Map<string, HostingTodoDto[]>();
     for (const r of rows) {
@@ -354,6 +466,83 @@ export default function HostingTodoBoard() {
   }, [displayDates]);
 
   const leaveSet = useMemo(() => new Set(leaveDates), [leaveDates]);
+  const isRestDate = useCallback((iso: string) => isWeeklyRestDate(iso, restDays), [restDays]);
+  const deferOptions = useMemo(() => ({ restDays, leaveDates: leaveSet }), [restDays, leaveSet]);
+
+  const saveRestDays = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/admin/hosting-rest-days', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ restDays: restDraft }),
+      });
+      const body = (await res.json()) as { error?: string; data?: unknown };
+      if (!res.ok) {
+        setError(body.error || '固休保存失败');
+        return;
+      }
+      setRestDays(parseWeeklyRestDays(body.data));
+      setRestPanelOpen(false);
+      setToast(restDraft.length ? `已设置每周固休：${formatRestDaysLabel(restDraft)}` : '已清除每周固休');
+    } catch {
+      setError('网络错误');
+    } finally {
+      setBusy(false);
+    }
+  }, [restDraft]);
+
+  /** 执行延后：先本地算方案，有错直接报错，否则进预览确认 */
+  const openDeferPreview = useCallback(
+    (item: HostingTodoDto, mode: 'days' | 'occurrences', n: number) => {
+      const plan =
+        mode === 'days'
+          ? planDeferByDays(toDeferRows(rows), item.id, n, deferOptions)
+          : planDeferByOccurrences(toDeferRows(rows), item.id, n, deferOptions);
+      setQueueMenu(null);
+      if (plan.error) {
+        setError(plan.error);
+        return;
+      }
+      if (plan.moves.length === 0) {
+        setToast('该方案下没有条目需要改期');
+        return;
+      }
+      setDeferPreview({
+        plan,
+        anchorName: item.roleName,
+        label: mode === 'days' ? `延后 ${n} 天` : `延后 ${n} 次`,
+      });
+    },
+    [rows, deferOptions],
+  );
+
+  const commitDefer = useCallback(async () => {
+    const preview = deferPreview;
+    if (!preview) return;
+    setDeferPreview(null);
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/admin/hosting-todos/bulk-move', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ moves: preview.plan.moves.map(m => ({ id: m.id, toDate: m.toDate })) }),
+      });
+      const body = (await res.json()) as { error?: string; moved?: number };
+      if (!res.ok) {
+        setError(body.error || '延后失败');
+        return;
+      }
+      setToast(`已${preview.label}，改期 ${body.moved ?? preview.plan.moves.length} 个条目`);
+      await load({ silent: true });
+    } catch {
+      setError('网络错误');
+    } finally {
+      setBusy(false);
+    }
+  }, [deferPreview, load]);
 
   const filteredCaptains = useMemo(() => {
     const q = captainFilter.trim().toLowerCase();
@@ -482,12 +671,12 @@ export default function HostingTodoBoard() {
     }
     const ok = await executePost({ ...payload, confirmWeekOverlap: false });
     if (!ok) return;
-    setToast('已添加至任务板');
     await load({ silent: true });
   }
 
   async function patchItem(id: number, patch: Partial<{ hostType: string; stuckTask: boolean; roleName: string }>) {
-    setBusy(true);
+    // 单条编辑：只标记该条目，不动全局 busy，避免整列表变暗
+    setBusyItemId(id);
     setError(null);
     try {
       if (patch.roleName !== undefined) {
@@ -522,13 +711,13 @@ export default function HostingTodoBoard() {
     } catch (e) {
       setError(e instanceof Error ? e.message : '更新失败');
     } finally {
-      setBusy(false);
+      setBusyItemId(null);
     }
   }
 
   async function removeItem(id: number) {
     if (!window.confirm('从任务板移除此条目？')) return;
-    setBusy(true);
+    setBusyItemId(id);
     setError(null);
     try {
       const res = await fetch(`/api/admin/hosting-todos/${id}`, { method: 'DELETE' });
@@ -539,17 +728,25 @@ export default function HostingTodoBoard() {
     } catch (e) {
       setError(e instanceof Error ? e.message : '删除失败');
     } finally {
-      setBusy(false);
+      setBusyItemId(null);
     }
   }
 
-  async function moveToDate(id: number, newDate: string) {
+  /** @param skipRestCheck 固休确认弹窗已放行时为 true，避免再次拦截 */
+  async function moveToDate(id: number, newDate: string, skipRestCheck = false) {
     const item = rows.find(r => r.id === id);
     if (!item) {
       setError('条目不存在');
       return;
     }
     if (item.todoDate === newDate) return;
+
+    // 落到固休日的后果与新建一致，同样拦截确认
+    if (!skipRestCheck && isRestDate(newDate) && !readRestDropSuppressed(todayIsoDate())) {
+      setRestDropSuppress(false);
+      setPendingRestDrop({ kind: 'move', targetDate: newDate, id, roleName: item.roleName });
+      return;
+    }
 
     const c = analyzeRoleScheduleConflict(toSchedulingRows(rows), {
       targetDate: newDate,
@@ -579,6 +776,38 @@ export default function HostingTodoBoard() {
     }
   }
 
+  /** 固休确认弹窗「仍要排入」 */
+  async function confirmRestDropAction() {
+    const p = pendingRestDrop;
+    if (!p) return;
+    setPendingRestDrop(null);
+    if (restDropSuppress) writeRestDropSuppressed(todayIsoDate());
+
+    setError(null);
+    try {
+      if (p.kind === 'create') {
+        // submitNewHostingEntry 自己不管 busy（平时由 onDropCaptainOnDate 包着），这里补上
+        setBusy(true);
+        try {
+          await submitNewHostingEntry({
+            todoDate: p.targetDate,
+            roleName: p.roleName,
+            hostType: DRAG_IN_HOST_TYPE,
+            stuckTask: DRAG_IN_STUCK,
+            captainId: p.captainId,
+          });
+        } finally {
+          setBusy(false);
+        }
+      } else {
+        // moveToDate 自带 setBusy/finally，外面再包一层会被它的 finally 提前清掉
+        await moveToDate(p.id, p.targetDate, true);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '操作失败');
+    }
+  }
+
   async function confirmWeekOverlapAction() {
     if (!pendingWeek) return;
     const p = pendingWeek;
@@ -589,11 +818,9 @@ export default function HostingTodoBoard() {
       if (p.kind === 'post') {
         const ok = await executePost({ ...p.body, confirmWeekOverlap: true });
         if (!ok) return;
-        setToast('已添加至任务板');
       } else {
         const ok = await executePut(p.id, { ...p.body, confirmWeekOverlap: true });
         if (!ok) return;
-        setToast('已保存');
       }
       await load({ silent: true });
     } catch (e) {
@@ -629,6 +856,12 @@ export default function HostingTodoBoard() {
       roleName = parsed.roleName ?? '';
       captainId = typeof parsed.captainId === 'number' ? parsed.captainId : undefined;
     } catch {
+      return;
+    }
+    // 固休日先确认，通过后才可能继续走「一周内重复」确认
+    if (isRestDate(targetDate) && !readRestDropSuppressed(todayIsoDate())) {
+      setRestDropSuppress(false);
+      setPendingRestDrop({ kind: 'create', targetDate, roleName, captainId });
       return;
     }
     setBusy(true);
@@ -712,12 +945,19 @@ export default function HostingTodoBoard() {
     // 检查是否是非舰长
     const captain = captains.find(c => captainScheduleName(c) === item.roleName);
     const isExpired = captain && currentGuardUids.size > 0 && !currentGuardUids.has(captain.uid);
+    // 只有本条目在操作、或整板级操作（拖动/延后）时才禁用
+    const itemBusy = busyItemId === item.id || busy;
 
     return (
       <li
         key={item.id}
         draggable
         onDragStart={e => onDragStartHosting(e, item)}
+        onContextMenu={e => {
+          e.preventDefault();
+          e.stopPropagation();
+          setQueueMenu({ item, x: e.clientX, y: e.clientY });
+        }}
         onDragOver={e => {
           e.preventDefault();
           e.stopPropagation();
@@ -744,7 +984,7 @@ export default function HostingTodoBoard() {
             /* ignore */
           }
         }}
-        className={`${th.card} ${th.cardAccent} rounded-r-md px-3.5 py-3 pl-3.5 sm:px-4 ${busy ? 'opacity-50' : ''}`}>
+        className={`${th.card} ${th.cardAccent} rounded-r-md px-3.5 py-3 pl-3.5 sm:px-4 ${itemBusy ? 'opacity-50' : ''}`}>
         <div className="flex flex-col gap-2.5">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0 flex-1 flex items-center gap-2">
@@ -772,7 +1012,7 @@ export default function HostingTodoBoard() {
                 type="button"
                 className="whitespace-nowrap text-sm text-[#b87a7a] transition hover:text-[#e8a0a0]"
                 onClick={() => void removeItem(item.id)}
-                disabled={busy}>
+                disabled={itemBusy}>
                 移除
               </button>
             </div>
@@ -782,7 +1022,7 @@ export default function HostingTodoBoard() {
               className="max-w-[140px] cursor-pointer rounded border border-[#2a3344] bg-[#0a0d12] px-2.5 py-1.5 text-sm text-[#b8c0cc] outline-none focus:border-[#c8aa6e]/50"
               value={ht}
               onChange={e => void patchItem(item.id, { hostType: e.target.value })}
-              disabled={busy}>
+              disabled={itemBusy}>
               {HOST_TYPES.map(t => (
                 <option key={t} value={t}>
                   {HOST_TYPE_LABEL[t]}
@@ -795,7 +1035,7 @@ export default function HostingTodoBoard() {
                 className="accent-[#c8aa6e]"
                 checked={item.stuckTask}
                 onChange={e => void patchItem(item.id, { stuckTask: e.target.checked })}
-                disabled={busy}
+                disabled={itemBusy}
               />
               卡任务
             </label>
@@ -894,8 +1134,28 @@ export default function HostingTodoBoard() {
       ) : null}
 
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 py-4 sm:px-6">
-        {toast ? <p className={`mb-3 shrink-0 rounded px-3 py-2 text-sm ${th.toastOk}`}>{toast}</p> : null}
-        {error ? <p className={`mb-3 shrink-0 rounded px-3 py-2 text-sm ${th.toastErr}`}>{error}</p> : null}
+        {/*
+          浮层而非占位：之前这两条是文档流里的 shrink-0 块，出现/消失会改变列表高度，
+          列表被顶下去再弹回来，看着就是「闪一下」。改成 fixed 后不参与布局。
+        */}
+        {toast || error ? (
+          <div className="pointer-events-none fixed left-1/2 top-3 z-[220] flex w-[min(92vw,420px)] -translate-x-1/2 flex-col gap-2">
+            {toast ? <p className={`rounded px-3 py-2 text-sm shadow-lg ${th.toastOk}`}>{toast}</p> : null}
+            {/* 错误不自动消失，所以要能点掉（toast 2.8s 后自己走） */}
+            {error ? (
+              <div className={`pointer-events-auto flex items-start gap-2 rounded px-3 py-2 text-sm shadow-lg ${th.toastErr}`}>
+                <span className="min-w-0 flex-1">{error}</span>
+                <button
+                  type="button"
+                  className="shrink-0 px-1 leading-none opacity-70 transition hover:opacity-100"
+                  aria-label="关闭错误提示"
+                  onClick={() => setError(null)}>
+                  ✕
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
         {loading ? (
           <div className="flex min-h-0 flex-1 items-center justify-center">
@@ -943,6 +1203,16 @@ export default function HostingTodoBoard() {
                   <span className={`mx-1 hidden font-mono text-[11px] sm:inline ${th.muted}`}>{weekRangeLabel}</span>
                   <button
                     type="button"
+                    className={`${th.btnGhost} px-2 py-1 text-[11px]`}
+                    onClick={() => {
+                      setRestDraft(restDays);
+                      setRestPanelOpen(true);
+                    }}
+                    title={`每周固休：${formatRestDaysLabel(restDays)}`}>
+                    固休{restDays.length ? ` · ${restDays.length}` : ''}
+                  </button>
+                  <button
+                    type="button"
                     className={`${th.btn} px-2.5 py-1 text-[11px]`}
                     onClick={() => setYearViewOpen(parseIsoDateParts(weekStart).year)}
                     title="按月/年浏览">
@@ -955,7 +1225,8 @@ export default function HostingTodoBoard() {
                   <div className="w-full max-w-5xl xl:max-w-6xl">
                     <p className={`mb-3 font-mono text-xs uppercase tracking-[0.12em] ${th.muted}`}>
                       <span className="sm:hidden">{weekRangeLabel} · </span>
-                      {isCurrentWeek ? '本周排期' : '所选周排期'}（周一至周日）· 红框为本周最后一天 · 左侧每日下方可标记请假，主页预案该日红框显示已请假
+                      {isCurrentWeek ? '本周排期' : '所选周排期'}（周一至周日）· 红框为本周最后一天 · 左侧每日下方可标记请假 ·
+                      灰底「固休」为每周固休 · 右键条目可按天/按次延后
                     </p>
                     {displayDates.map((date: string, idx: number) => {
                       const list = byDate.get(date) ?? [];
@@ -975,12 +1246,29 @@ export default function HostingTodoBoard() {
                           ) : null}
 
                           <div
+                            title={
+                              leaveSet.has(date) && isRestDate(date)
+                                ? '固休 + 已请假'
+                                : isRestDate(date)
+                                  ? '每周固休'
+                                  : undefined
+                            }
                             className={`relative flex w-[100px] shrink-0 flex-col items-end border-r ${th.line} ${th.rail} py-5 pr-3 sm:w-[120px] sm:pr-4 ${
-                              leaveSet.has(date) ? 'bg-rose-950/20 ring-1 ring-inset ring-rose-900/35' : ''
+                              leaveSet.has(date)
+                                ? 'bg-rose-950/20 ring-1 ring-inset ring-rose-900/35'
+                                : isRestDate(date)
+                                  ? 'bg-[#141821] ring-1 ring-inset ring-[#39414f]'
+                                  : ''
                             }`}>
                             <span className="font-mono text-4xl font-bold leading-none tracking-tight text-[#c8aa6e] sm:text-5xl">{dayNum}</span>
                             <span className="mt-1.5 font-mono text-xs tracking-widest text-[#5c6574]">{ym}</span>
                             <span className="mt-1 text-sm text-[#8a9199]">{wd}</span>
+                            {/* 请假（红）优先级高于固休（灰）；同日时只显示红色，差异在 title 里说明 */}
+                            {isRestDate(date) && !leaveSet.has(date) ? (
+                              <span className="mt-1.5 rounded border border-[#3d4654] bg-[#1b2029] px-1.5 py-0.5 text-[10px] font-semibold tracking-wider text-[#9aa5b4]">
+                                固休
+                              </span>
+                            ) : null}
                             <div className="mt-3 flex w-full flex-col items-end gap-1.5">
                               {leaveSet.has(date) ? (
                                 <>
@@ -1203,6 +1491,182 @@ export default function HostingTodoBoard() {
         )}
       </main>
 
+      {/* 每周固休配置 */}
+      {restPanelOpen ? (
+        <>
+          <button
+            type="button"
+            aria-label="关闭固休设置"
+            className="fixed inset-0 z-[100] cursor-default bg-black/55 backdrop-blur-[1px]"
+            onClick={() => setRestPanelOpen(false)}
+          />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="hosting-rest-dialog-title"
+            className={`fixed left-1/2 top-[42%] z-[101] w-[min(92vw,400px)] -translate-x-1/2 -translate-y-1/2 rounded-lg border p-5 shadow-2xl ${th.panel}`}>
+            <h2 id="hosting-rest-dialog-title" className={`text-center text-base font-semibold ${th.gold}`}>
+              每周固休
+            </h2>
+            <p className={`mt-2 text-center text-xs leading-relaxed ${th.muted}`}>
+              可多选。固休日仍可拖入，但会先弹窗确认；延后时会跳过空的固休日与请假日，
+              <span className="text-[#b8a880]">已有安排的固休日按正常排期日对待</span>。
+            </p>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              {WEEKDAY_OPTIONS.map(opt => {
+                const checked = restDraft.includes(opt.value);
+                return (
+                  <label
+                    key={opt.value}
+                    className={`flex cursor-pointer items-center gap-2 rounded border px-2.5 py-2 text-sm transition ${
+                      checked
+                        ? `${th.goldBorder} ${th.goldBg} text-[#e8d49a]`
+                        : 'border-[#2a3344] text-[#9aa5b4] hover:border-[#3d4a5f]'
+                    }`}>
+                    <input
+                      type="checkbox"
+                      className="accent-[#c8aa6e]"
+                      checked={checked}
+                      disabled={busy}
+                      onChange={e =>
+                        setRestDraft(prev =>
+                          e.target.checked
+                            ? [...prev, opt.value].sort((a, b) => a - b)
+                            : prev.filter(v => v !== opt.value),
+                        )
+                      }
+                    />
+                    {opt.label}
+                  </label>
+                );
+              })}
+            </div>
+            <p className={`mt-3 text-center font-mono text-[11px] ${th.muted}`}>
+              当前草稿：{formatRestDaysLabel(restDraft)}
+            </p>
+            <div className="mt-5 flex flex-col gap-2.5 sm:flex-row-reverse sm:justify-center sm:gap-3">
+              <button
+                type="button"
+                disabled={busy || restDraft.length === 7}
+                className={`w-full sm:w-auto sm:min-w-[120px] ${th.btn}`}
+                onClick={() => void saveRestDays()}>
+                保存
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                className={`w-full sm:w-auto sm:min-w-[120px] ${th.btnGhost}`}
+                onClick={() => setRestPanelOpen(false)}>
+                取消
+              </button>
+            </div>
+            {restDraft.length === 7 ? (
+              <p className="mt-2 text-center text-[11px] text-rose-300">不能把 7 天全部设为固休。</p>
+            ) : null}
+          </div>
+        </>
+      ) : null}
+
+      {/* 拖入固休日确认 */}
+      {pendingRestDrop ? (
+        <>
+          <button
+            type="button"
+            aria-label="取消排入固休日"
+            className="fixed inset-0 z-[100] cursor-default bg-black/55 backdrop-blur-[1px]"
+            onClick={() => setPendingRestDrop(null)}
+          />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="hosting-rest-drop-title"
+            className={`fixed left-1/2 top-[42%] z-[101] w-[min(92vw,400px)] -translate-x-1/2 -translate-y-1/2 rounded-lg border p-5 shadow-2xl ${th.panel}`}>
+            <h2 id="hosting-rest-drop-title" className={`text-center text-base font-semibold ${th.gold}`}>
+              该日为每周固休
+            </h2>
+            <p className={`mt-2 text-center font-mono text-xs ${th.muted}`}>
+              {pendingRestDrop.targetDate} · {weekdayLabel(pendingRestDrop.targetDate)}
+            </p>
+            <p className={`mt-3 text-center text-sm leading-relaxed ${th.muted}`}>
+              确认把「{pendingRestDrop.roleName}」{pendingRestDrop.kind === 'create' ? '排入' : '改期到'}固休日？
+            </p>
+            <label className={`mt-4 flex cursor-pointer items-center justify-center gap-2 text-xs ${th.muted}`}>
+              <input
+                type="checkbox"
+                className="accent-[#c8aa6e]"
+                checked={restDropSuppress}
+                onChange={e => setRestDropSuppress(e.target.checked)}
+              />
+              今日不再提醒
+            </label>
+            <div className="mt-5 flex flex-col gap-2.5 sm:flex-row-reverse sm:justify-center sm:gap-3">
+              <button
+                type="button"
+                disabled={busy}
+                className={`w-full sm:w-auto sm:min-w-[120px] ${th.btn}`}
+                onClick={() => void confirmRestDropAction()}>
+                仍要排入
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                className={`w-full sm:w-auto sm:min-w-[120px] ${th.btnGhost}`}
+                onClick={() => setPendingRestDrop(null)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </>
+      ) : null}
+
+      {queueMenu ? <QueueContextMenu menu={queueMenu} busy={busy} onDefer={openDeferPreview} /> : null}
+
+      {/* 延后预览确认 */}
+      {deferPreview ? (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 px-4" role="dialog" aria-modal="true">
+          <div className={`w-[min(92vw,440px)] rounded-lg border ${th.line} ${th.panel} p-6 shadow-2xl`}>
+            <p className="font-mono text-xs uppercase tracking-[0.2em] text-[#c8aa6e]">延后确认</p>
+            <h2 className="mt-2 text-lg font-semibold text-[#ece8df]">
+              以「{deferPreview.anchorName}」为起点，{deferPreview.label}
+            </h2>
+            <dl className={`mt-4 space-y-2 text-sm ${th.muted}`}>
+              <div className="flex justify-between gap-3">
+                <dt>受影响条目</dt>
+                <dd className="font-mono text-[#d4cfc4]">{deferPreview.plan.affectedCount} 个</dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt>实际改期</dt>
+                <dd className="font-mono text-[#d4cfc4]">{deferPreview.plan.moves.length} 个</dd>
+              </div>
+              {deferPreview.plan.originalRange && deferPreview.plan.nextRange ? (
+                <div className="flex justify-between gap-3">
+                  <dt>日期范围</dt>
+                  <dd className="text-right font-mono text-[11px] text-[#d4cfc4]">
+                    {deferPreview.plan.nextRange.from} → {deferPreview.plan.nextRange.to}
+                    <span className="block text-[#6d7684]">
+                      原 {deferPreview.plan.originalRange.from} → {deferPreview.plan.originalRange.to}
+                    </span>
+                  </dd>
+                </div>
+              ) : null}
+            </dl>
+            {deferPreview.plan.crowdedDays > 0 ? (
+              <p className="mt-3 rounded border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-[11px] leading-relaxed text-amber-200/90">
+                延后后有 {deferPreview.plan.crowdedDays} 天包含多个条目。
+              </p>
+            ) : null}
+            <div className="mt-6 flex justify-end gap-3">
+              <button type="button" className={th.btnGhost} disabled={busy} onClick={() => setDeferPreview(null)}>
+                取消
+              </button>
+              <button type="button" className={th.btn} disabled={busy} onClick={() => void commitDefer()}>
+                确认延后
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {pendingWeek ? (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 px-4" role="dialog" aria-modal="true">
           <div className={`max-w-md rounded-lg border ${th.line} ${th.panel} p-6 shadow-2xl`}>
@@ -1234,6 +1698,7 @@ export default function HostingTodoBoard() {
           year={yearViewOpen}
           rows={rows}
           leaveDates={leaveDates}
+          restDays={restDays}
           todayIso={todayIso}
           activeWeekStart={weekStart}
           onChangeYear={y => setYearViewOpen(y)}
@@ -1248,10 +1713,121 @@ export default function HostingTodoBoard() {
   );
 }
 
+/**
+ * 队列右键菜单：两个独立维度的延后入口
+ * 坐标做视口边界夹取，否则在最后一行/最右侧会溢出
+ */
+function QueueContextMenu({
+  menu,
+  busy,
+  onDefer,
+}: {
+  menu: QueueMenu;
+  busy: boolean;
+  onDefer: (item: HostingTodoDto, mode: 'days' | 'occurrences', n: number) => void;
+}) {
+  const [days, setDays] = useState('1');
+  const [times, setTimes] = useState('1');
+
+  const MENU_W = 248;
+  const MENU_H = 208;
+  const left = Math.max(8, Math.min(menu.x, window.innerWidth - MENU_W - 8));
+  const top = Math.max(8, Math.min(menu.y, window.innerHeight - MENU_H - 8));
+
+  // 之前这里非法输入直接 return，点「执行」没有任何反馈，看着像坏了
+  const [hint, setHint] = useState<string | null>(null);
+
+  function run(mode: 'days' | 'occurrences', raw: string) {
+    const t = raw.trim();
+    if (!t) {
+      setHint('请先填写数字');
+      return;
+    }
+    const n = Number(t);
+    if (!Number.isInteger(n) || n < 1) {
+      setHint('须为 ≥ 1 的整数');
+      return;
+    }
+    if (n > MAX_DEFER_N) {
+      setHint(`不能超过 ${MAX_DEFER_N}`);
+      return;
+    }
+    setHint(null);
+    onDefer(menu.item, mode, n);
+  }
+
+  return (
+    <div
+      data-queue-menu
+      role="menu"
+      style={{ left, top, width: MENU_W }}
+      className={`fixed z-[210] rounded-md border ${th.line} ${th.panel} p-2.5 shadow-2xl`}>
+      <p className={`mb-2 truncate px-1 font-mono text-[11px] ${th.muted}`} title={menu.item.roleName}>
+        {menu.item.roleName} · {menu.item.todoDate}
+      </p>
+
+      <div className="flex flex-col gap-2">
+        <div className="rounded border border-[#232b38] bg-[#0a0d12] p-2">
+          <label className={`mb-1.5 block text-[11px] ${th.muted}`}>以此节点延后（天）</label>
+          <div className="flex items-center gap-1.5">
+            <input
+              type="number"
+              min={1}
+              max={MAX_DEFER_N}
+              className={`${th.input} w-full px-2 py-1 text-sm`}
+              value={days}
+              disabled={busy}
+              onChange={e => setDays(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') run('days', days);
+              }}
+            />
+            <button
+              type="button"
+              className={`${th.btn} shrink-0 px-2.5 py-1 text-[11px]`}
+              disabled={busy}
+              onClick={() => run('days', days)}>
+              执行
+            </button>
+          </div>
+        </div>
+
+        <div className="rounded border border-[#232b38] bg-[#0a0d12] p-2">
+          <label className={`mb-1.5 block text-[11px] ${th.muted}`}>以此节点延后（次）</label>
+          <div className="flex items-center gap-1.5">
+            <input
+              type="number"
+              min={1}
+              max={MAX_DEFER_N}
+              className={`${th.input} w-full px-2 py-1 text-sm`}
+              value={times}
+              disabled={busy}
+              onChange={e => setTimes(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') run('occurrences', times);
+              }}
+            />
+            <button
+              type="button"
+              className={`${th.btn} shrink-0 px-2.5 py-1 text-[11px]`}
+              disabled={busy}
+              onClick={() => run('occurrences', times)}>
+              执行
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {hint ? <p className="mt-2 px-1 text-[11px] text-rose-300">{hint}</p> : null}
+    </div>
+  );
+}
+
 function YearCalendarOverlay({
   year,
   rows,
   leaveDates,
+  restDays,
   todayIso,
   activeWeekStart,
   onChangeYear,
@@ -1261,6 +1837,7 @@ function YearCalendarOverlay({
   year: number;
   rows: HostingTodoDto[];
   leaveDates: string[];
+  restDays: IsoWeekday[];
   todayIso: string;
   activeWeekStart: string;
   onChangeYear: (y: number) => void;
@@ -1334,6 +1911,7 @@ function YearCalendarOverlay({
               month={month}
               countByDate={countByDate}
               leaveSet={leaveSet}
+              restDays={restDays}
               todayIso={todayIso}
               activeWeek={activeWeek}
               onPick={onPickWeek}
@@ -1342,7 +1920,7 @@ function YearCalendarOverlay({
         </div>
 
         <p className={`shrink-0 border-t ${th.line} px-4 py-2 text-center text-[11px] ${th.muted}`}>
-          点击任意一天 · 跳到该日所在周 · 黄圈=今日 · 金色背景=有任务 · 红下划线=请假
+          点击任意一天 · 跳到该日所在周 · 黄圈=今日 · 金色背景=有任务 · 红下划线=请假 · 灰字=固休
         </p>
       </div>
     </>
@@ -1354,6 +1932,7 @@ function YearMiniMonth({
   month,
   countByDate,
   leaveSet,
+  restDays,
   todayIso,
   activeWeek,
   onPick,
@@ -1362,6 +1941,7 @@ function YearMiniMonth({
   month: number;
   countByDate: Map<string, number>;
   leaveSet: Set<string>;
+  restDays: IsoWeekday[];
   todayIso: string;
   activeWeek: Set<string>;
   onPick: (iso: string) => void;
@@ -1385,6 +1965,7 @@ function YearMiniMonth({
           const inMonth = parts.month === month;
           const count = countByDate.get(iso) ?? 0;
           const leave = leaveSet.has(iso);
+          const rest = isWeeklyRestDate(iso, restDays);
           const isToday = iso === todayIso;
           const inActive = activeWeek.has(iso);
           return (
@@ -1392,9 +1973,9 @@ function YearMiniMonth({
               key={iso}
               type="button"
               onClick={() => onPick(iso)}
-              title={`${iso}${count ? ` · ${count} 项` : ''}${leave ? ' · 已请假' : ''}`}
+              title={`${iso}${count ? ` · ${count} 项` : ''}${leave ? ' · 已请假' : ''}${rest ? ' · 固休' : ''}`}
               className={`relative flex aspect-square items-center justify-center rounded text-[10px] tabular-nums transition ${
-                !inMonth ? 'text-[#3a4150]' : 'text-[#d4cfc4]'
+                !inMonth ? 'text-[#3a4150]' : rest && !leave ? 'text-[#7b8493]' : 'text-[#d4cfc4]'
               } ${
                 inActive ? 'ring-1 ring-[#c8aa6e]/60' : ''
               } ${

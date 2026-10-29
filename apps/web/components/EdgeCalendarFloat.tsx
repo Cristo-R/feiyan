@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { captainAvatarImgReferrerPolicy, captainAvatarImgSrc } from '@/lib/captain-avatar-placeholder';
 import { HOST_TYPE_LABEL } from '@/lib/hosting-types';
 import { addDaysIso } from '@/lib/hosting-todo-schedule';
+import { isWeeklyRestDate, parseWeeklyRestDays, type IsoWeekday } from '@/lib/hosting-rest-days';
 import {
   isoDatesCurrentWeek,
   mondayIsoOfWeekContaining,
@@ -230,7 +231,8 @@ function PanelHeader({
 function PanelLegend() {
   return (
     <p className="mx-auto max-w-lg border-t border-gray-100 bg-white px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 text-center text-[10px] leading-relaxed text-gray-400 md:pb-4">
-      粉圈扫号 · 蓝圈组排 · 「!」卡任务 · <span className="font-medium text-red-600/90">红框为已请假</span>
+      粉圈扫号 · 蓝圈组排 · 「!」卡任务 · <span className="font-medium text-red-600/90">红框为已请假</span> ·{' '}
+      <span className="font-medium text-gray-500">灰色为固休</span>
       <span className="hidden md:inline"> · 当日满 4 人及以上时，该列在格内纵向滚动</span>
     </p>
   );
@@ -242,35 +244,47 @@ type DayColumnProps = {
   list: HostWeekTodo[];
   isToday: boolean;
   onLeave: boolean;
+  /** 每周固休：灰色展示，优先级低于请假（同日时只显示请假的红色） */
+  isRest: boolean;
   dense: boolean;
 };
 
-function WeekDayColumn({ iso, idx, list, isToday, onLeave, dense }: DayColumnProps) {
+function WeekDayColumn({ iso, idx, list, isToday, onLeave, isRest, dense }: DayColumnProps) {
   const dm = dayOfMonthFromIso(iso);
-  const colToday = isToday && !onLeave;
+  // 固休日一旦有安排就是正常工作日（与延后引擎同一规则），不该再标「固休」
+  const rest = isRest && !onLeave && list.length === 0;
+  const colToday = isToday && !onLeave && !rest;
   return (
     <div
       className={`flex h-full min-h-0 flex-col overflow-hidden rounded-xl border bg-white transition-colors ${
         onLeave
           ? 'border-red-500/80 bg-gradient-to-b from-red-50 to-red-50/90 ring-2 ring-red-600/90'
-          : colToday
-            ? 'border-amber-400 bg-gradient-to-b from-amber-50 to-amber-50 ring-1 ring-amber-200'
-            : 'border-gray-200 bg-gradient-to-b from-gray-50 to-white'
+          : rest
+            ? 'border-gray-300 bg-gradient-to-b from-gray-100 to-gray-50 ring-1 ring-gray-200'
+            : colToday
+              ? 'border-amber-400 bg-gradient-to-b from-amber-50 to-amber-50 ring-1 ring-amber-200'
+              : 'border-gray-200 bg-gradient-to-b from-gray-50 to-white'
       }`}>
       <div
         className={`flex shrink-0 flex-col items-center justify-center gap-0.5 border-b px-0.5 py-1.5 sm:py-2 ${
-          onLeave ? 'border-red-200 bg-red-100' : colToday ? 'border-amber-200 bg-amber-100' : 'border-gray-200 bg-gray-50'
+          onLeave
+            ? 'border-red-200 bg-red-100'
+            : rest
+              ? 'border-gray-200 bg-gray-200/70'
+              : colToday
+                ? 'border-amber-200 bg-amber-100'
+                : 'border-gray-200 bg-gray-50'
         }`}>
         <span
           className={`text-[10px] font-semibold uppercase tracking-[0.06em] sm:text-[11px] ${
-            onLeave ? 'text-red-800' : colToday ? 'text-amber-900' : 'text-gray-400'
+            onLeave ? 'text-red-800' : rest ? 'text-gray-500' : colToday ? 'text-amber-900' : 'text-gray-400'
           }`}>
           周{WEEK_TAB_LABELS[idx]}
         </span>
         <div className="flex items-center justify-center gap-1">
           <span
             className={`text-sm font-bold tabular-nums sm:text-base ${
-              onLeave ? 'text-red-950' : colToday ? 'text-gray-900' : 'text-gray-700'
+              onLeave ? 'text-red-950' : rest ? 'text-gray-500' : colToday ? 'text-gray-900' : 'text-gray-700'
             }`}>
             {dm}
           </span>
@@ -283,13 +297,18 @@ function WeekDayColumn({ iso, idx, list, isToday, onLeave, dense }: DayColumnPro
             </span>
           ) : null}
         </div>
-        {onLeave ? <span className="mt-0.5 text-[10px] font-bold tracking-wide text-red-700 sm:text-[11px]">已请假</span> : null}
+        {onLeave ? (
+          <span className="mt-0.5 text-[10px] font-bold tracking-wide text-red-700 sm:text-[11px]">已请假</span>
+        ) : rest ? (
+          <span className="mt-0.5 text-[10px] font-bold tracking-wide text-gray-500 sm:text-[11px]">固休</span>
+        ) : null}
       </div>
 
       {list.length === 0 ? (
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center bg-white py-6">
-          <span className={`text-[11px] ${onLeave ? 'font-semibold text-red-600' : 'text-gray-300'}`}>
-            {onLeave ? '已请假' : '空'}
+          <span
+            className={`text-[11px] ${onLeave ? 'font-semibold text-red-600' : rest ? 'font-medium text-gray-400' : 'text-gray-300'}`}>
+            {onLeave ? '已请假' : rest ? '固休' : '空'}
           </span>
         </div>
       ) : dense ? (
@@ -314,22 +333,30 @@ function WeekDayColumn({ iso, idx, list, isToday, onLeave, dense }: DayColumnPro
 }
 
 /** 移动端：单日全宽展示，多人时用网格而非窄列滚动 */
-function MobileDayDetail({ iso, idx, list, isToday, onLeave }: DayColumnProps) {
+function MobileDayDetail({ iso, idx, list, isToday, onLeave, isRest }: DayColumnProps) {
   const dm = dayOfMonthFromIso(iso);
   const dense = list.length > DENSE_LIST_THRESHOLD;
-  const colToday = isToday && !onLeave;
+  // 同上：有安排的固休日按正常工作日展示
+  const rest = isRest && !onLeave && list.length === 0;
+  const colToday = isToday && !onLeave && !rest;
 
   return (
     <div
       className={`rounded-xl border ${
-        onLeave ? 'border-red-500/80 bg-red-50/90 ring-2 ring-red-600/80' : colToday ? 'border-amber-300 bg-amber-50/50' : 'border-gray-200 bg-white'
+        onLeave
+          ? 'border-red-500/80 bg-red-50/90 ring-2 ring-red-600/80'
+          : rest
+            ? 'border-gray-300 bg-gray-50 ring-1 ring-gray-200'
+            : colToday
+              ? 'border-amber-300 bg-amber-50/50'
+              : 'border-gray-200 bg-white'
       }`}>
       <div
         className={`flex items-center justify-between gap-2 border-b px-4 py-3 ${
-          onLeave ? 'border-red-200' : colToday ? 'border-amber-200' : 'border-gray-100'
+          onLeave ? 'border-red-200' : rest ? 'border-gray-200' : colToday ? 'border-amber-200' : 'border-gray-100'
         }`}>
         <div>
-          <p className={`text-sm font-bold ${onLeave ? 'text-red-900' : 'text-gray-900'}`}>
+          <p className={`text-sm font-bold ${onLeave ? 'text-red-900' : rest ? 'text-gray-600' : 'text-gray-900'}`}>
             周{WEEK_TAB_LABELS[idx]} · {dm} 日
             {colToday ? <span className="ml-2 text-xs font-semibold text-amber-700">今天</span> : null}
           </p>
@@ -337,6 +364,8 @@ function MobileDayDetail({ iso, idx, list, isToday, onLeave }: DayColumnProps) {
         </div>
         {onLeave ? (
           <span className="shrink-0 rounded-full bg-red-200 px-2.5 py-1 text-xs font-bold text-red-900">已请假</span>
+        ) : rest ? (
+          <span className="shrink-0 rounded-full bg-gray-200 px-2.5 py-1 text-xs font-bold text-gray-600">固休</span>
         ) : list.length > 0 ? (
           <span className="shrink-0 rounded-full bg-gray-200 px-2.5 py-1 text-xs font-semibold tabular-nums text-gray-700">
             {list.length} 人
@@ -346,8 +375,9 @@ function MobileDayDetail({ iso, idx, list, isToday, onLeave }: DayColumnProps) {
 
       <div className="px-3 py-4">
         {list.length === 0 ? (
-          <p className={`py-8 text-center text-sm ${onLeave ? 'font-medium text-red-600' : 'text-gray-400'}`}>
-            {onLeave ? '本日已请假' : '暂无安排'}
+          <p
+            className={`py-8 text-center text-sm ${onLeave ? 'font-medium text-red-600' : rest ? 'font-medium text-gray-500' : 'text-gray-400'}`}>
+            {onLeave ? '本日已请假' : rest ? '本日固休' : '暂无安排'}
           </p>
         ) : dense ? (
           <div className="grid grid-cols-3 gap-2.5 sm:grid-cols-4">
@@ -375,6 +405,9 @@ export default function EdgeCalendarFloat() {
   const [selectedIso, setSelectedIso] = useState<string>(() => todayIso);
   const [todos, setTodos] = useState<HostWeekTodo[]>([]);
   const [leaveDates, setLeaveDates] = useState<string[]>([]);
+  const [restDates, setRestDates] = useState<string[]>([]);
+  /** 固休规则本体：月视图跨整月，不能只用当周展开结果 */
+  const [restDays, setRestDays] = useState<IsoWeekday[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [monthPickerOpen, setMonthPickerOpen] = useState(false);
@@ -395,22 +428,34 @@ export default function EdgeCalendarFloat() {
         cache: 'no-store',
       });
       const body = (await res.json()) as {
-        data?: { weekDates: string[]; todos: HostWeekTodo[]; leaveDates?: string[] };
+        data?: {
+          weekDates: string[];
+          todos: HostWeekTodo[];
+          leaveDates?: string[];
+          restDates?: string[];
+          restDays?: unknown;
+        };
         error?: string;
       };
       if (!res.ok) {
         setLoadError(body.error || '加载失败');
         setTodos([]);
         setLeaveDates([]);
+        setRestDates([]);
+        setRestDays([]);
         return;
       }
       if (body.data?.weekDates?.length) setWeekDates(body.data.weekDates);
       setTodos(body.data?.todos ?? []);
       setLeaveDates(body.data?.leaveDates ?? []);
+      setRestDates(body.data?.restDates ?? []);
+      setRestDays(parseWeeklyRestDays(body.data?.restDays));
     } catch {
       setLoadError('网络错误');
       setTodos([]);
       setLeaveDates([]);
+      setRestDates([]);
+      setRestDays([]);
     } finally {
       setLoading(false);
     }
@@ -468,6 +513,7 @@ export default function EdgeCalendarFloat() {
   }, [todos]);
 
   const leaveSet = useMemo(() => new Set(leaveDates), [leaveDates]);
+  const restSet = useMemo(() => new Set(restDates), [restDates]);
 
   const selectedIdx = weekDates.indexOf(selectedIso);
   const selectedList = byDate.get(selectedIso) ?? [];
@@ -537,32 +583,44 @@ export default function EdgeCalendarFloat() {
               const list = byDate.get(iso) ?? [];
               const isToday = iso === todayIso;
               const onLeave = leaveSet.has(iso);
+              const rest = restSet.has(iso) && !onLeave && list.length === 0;
               const selected = iso === selectedIso;
               const dm = dayOfMonthFromIso(iso);
               return (
                 <button
                   key={iso}
                   type="button"
+                  title={onLeave ? '已请假' : rest ? '每周固休' : undefined}
                   onClick={() => setSelectedIso(iso)}
                   className={`flex shrink-0 flex-col items-center rounded-xl border px-3 py-2 min-w-[3.25rem] transition ${
                     selected
                       ? onLeave
                         ? 'border-red-500 bg-red-100 ring-2 ring-red-500/50'
-                        : isToday
-                          ? 'border-amber-400 bg-amber-100 ring-2 ring-amber-300/80'
-                          : 'border-[#00A1D6] bg-sky-50 ring-2 ring-sky-200'
+                        : rest
+                          ? 'border-gray-400 bg-gray-200 ring-2 ring-gray-300'
+                          : isToday
+                            ? 'border-amber-400 bg-amber-100 ring-2 ring-amber-300/80'
+                            : 'border-[#00A1D6] bg-sky-50 ring-2 ring-sky-200'
                       : onLeave
                         ? 'border-red-200 bg-red-50/80'
-                        : 'border-gray-200 bg-gray-50'
+                        : rest
+                          ? 'border-gray-300 bg-gray-100'
+                          : 'border-gray-200 bg-gray-50'
                   }`}>
-                  <span className={`text-[10px] font-semibold ${onLeave ? 'text-red-800' : 'text-gray-500'}`}>
+                  <span
+                    className={`text-[10px] font-semibold ${onLeave ? 'text-red-800' : rest ? 'text-gray-500' : 'text-gray-500'}`}>
                     周{WEEK_TAB_LABELS[idx]}
                   </span>
-                  <span className={`text-base font-bold tabular-nums ${onLeave ? 'text-red-950' : 'text-gray-800'}`}>{dm}</span>
+                  <span
+                    className={`text-base font-bold tabular-nums ${onLeave ? 'text-red-950' : rest ? 'text-gray-500' : 'text-gray-800'}`}>
+                    {dm}
+                  </span>
                   {list.length > 0 ? (
                     <span className="mt-0.5 text-[9px] font-medium text-gray-500">{list.length}人</span>
                   ) : onLeave ? (
                     <span className="mt-0.5 text-[9px] font-bold text-red-700">假</span>
+                  ) : rest ? (
+                    <span className="mt-0.5 text-[9px] font-bold text-gray-500">休</span>
                   ) : null}
                 </button>
               );
@@ -578,6 +636,7 @@ export default function EdgeCalendarFloat() {
               list={selectedList}
               isToday={selectedIso === todayIso}
               onLeave={leaveSet.has(selectedIso)}
+              isRest={restSet.has(selectedIso)}
               dense={selectedList.length > DENSE_LIST_THRESHOLD}
             />
           ) : null}
@@ -625,6 +684,7 @@ export default function EdgeCalendarFloat() {
                         list={list}
                         isToday={iso === todayIso}
                         onLeave={leaveSet.has(iso)}
+                        isRest={restSet.has(iso)}
                         dense={list.length > DENSE_LIST_THRESHOLD}
                       />
                     );
@@ -645,6 +705,7 @@ export default function EdgeCalendarFloat() {
           weekStart={weekStart}
           todos={todos}
           leaveDates={leaveDates}
+          restDays={restDays}
           todayIso={todayIso}
           onPickWeek={iso => {
             setWeekStart(mondayIsoOfWeekContaining(iso));
@@ -661,6 +722,7 @@ function MonthPickerOverlay({
   weekStart,
   todos,
   leaveDates,
+  restDays,
   todayIso,
   onPickWeek,
   onClose,
@@ -668,6 +730,7 @@ function MonthPickerOverlay({
   weekStart: string;
   todos: HostWeekTodo[];
   leaveDates: string[];
+  restDays: IsoWeekday[];
   todayIso: string;
   onPickWeek: (iso: string) => void;
   onClose: () => void;
@@ -750,6 +813,7 @@ function MonthPickerOverlay({
             const inMonth = parts.month === pickerMonth;
             const count = countByDate.get(iso) ?? 0;
             const leave = leaveSet.has(iso);
+            const rest = isWeeklyRestDate(iso, restDays) && !leave && count === 0;
             const isToday = iso === todayIso;
             const inActive = activeWeek.has(iso);
             return (
@@ -757,13 +821,17 @@ function MonthPickerOverlay({
                 key={iso}
                 type="button"
                 onClick={() => onPickWeek(iso)}
-                title={`${iso}${count ? ` · ${count} 项` : ''}${leave ? ' · 已请假' : ''}`}
+                title={`${iso}${count ? ` · ${count} 项` : ''}${leave ? ' · 已请假' : ''}${rest ? ' · 固休' : ''}`}
                 className={`relative flex aspect-square items-center justify-center rounded text-xs tabular-nums transition ${
-                  !inMonth ? 'text-gray-300' : 'text-gray-800'
+                  !inMonth ? 'text-gray-300' : rest ? 'text-gray-400' : 'text-gray-800'
                 } ${
                   inActive ? 'ring-2 ring-[#00A1D6]/55' : ''
                 } ${
-                  count > 0 && inMonth ? 'bg-amber-100/70 font-semibold text-amber-900' : 'hover:bg-gray-100'
+                  count > 0 && inMonth
+                    ? 'bg-amber-100/70 font-semibold text-amber-900'
+                    : rest && inMonth
+                      ? 'bg-gray-100'
+                      : 'hover:bg-gray-100'
                 } ${isToday ? 'outline outline-1 outline-amber-400' : ''} ${
                   leave && inMonth ? 'underline decoration-rose-500 decoration-2 underline-offset-[2px]' : ''
                 }`}>

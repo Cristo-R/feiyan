@@ -2,7 +2,8 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { captainAvatarUrlForPublicSite, captainRowToDto, type CaptainApiDto } from '@/lib/captain-dto';
 import { captainScheduleName } from '@/lib/captain-schedule-name';
-import { listCaptains, listHostingLeaveDates, listHostingTodos } from '@/lib/db';
+import { getSiteSetting, listCaptains, listHostingLeaveDates, listHostingTodos } from '@/lib/db';
+import { REST_SETTING_KEY, filterRestDates, parseWeeklyRestDays } from '@/lib/hosting-rest-days';
 import { DEFAULT_HOST_TYPE, isHostType } from '@/lib/hosting-types';
 import {
   isValidIsoDate,
@@ -58,8 +59,12 @@ export async function GET(req: NextRequest) {
       );
 
     const leaveDates = leaveAll.filter(d => set.has(d));
+    // 固休与请假分开返回：前台样式需要区分（灰「固休」vs 红框「已请假」）
+    const restDays = parseWeeklyRestDays(await getSiteSetting(REST_SETTING_KEY));
+    const restDates = filterRestDates(weekDates, restDays);
 
-    return NextResponse.json({ data: { weekDates, todos, leaveDates } });
+    // 同时返回规则本体：月视图跨越整月，当周展开结果不够用
+    return NextResponse.json({ data: { weekDates, todos, leaveDates, restDates, restDays } });
   } catch (e) {
     console.error('[site/hosting-week]', e);
     return NextResponse.json({ error: '加载失败' }, { status: 500 });
