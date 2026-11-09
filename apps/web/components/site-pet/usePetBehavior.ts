@@ -64,11 +64,11 @@ export function usePetBehavior({
     setMenuOpen(false);
   }, [dragRef, liveActive, setMenuOpen, setMood]);
 
-  const showBubble = useCallback((nextMessage: string) => {
+  const showBubble = useCallback((nextMessage: string, duration = 3200) => {
     if (bubbleTimerRef.current) window.clearTimeout(bubbleTimerRef.current);
     setMessage(nextMessage);
     setBubbleVisible(true);
-    bubbleTimerRef.current = window.setTimeout(() => setBubbleVisible(false), 3200);
+    bubbleTimerRef.current = window.setTimeout(() => setBubbleVisible(false), duration);
   }, [bubbleTimerRef, setBubbleVisible, setMessage]);
 
   const say = useCallback((

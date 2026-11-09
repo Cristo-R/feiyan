@@ -15,10 +15,12 @@ import {
   petActions,
 } from './site-pet/petActions';
 import { getPetAssetDisplayUrl, isPetAssetReady, loadPetAsset, warmPetAssets } from './site-pet/petAssetLoader';
-import { liveLines, patLines, pick, scoldLines, tapLines, teaseLines } from './site-pet/petLines';
+import { patLines, pick, scoldLines, tapLines, teaseLines } from './site-pet/petLines';
 import type { DragPart, IdleVariant, PetFrame, PetMood } from './site-pet/petTypes';
 import { usePetBehavior } from './site-pet/usePetBehavior';
 import ContinuousPetCanvas from './site-pet/ContinuousPetCanvas';
+import PetCaptainDialog from './site-pet/PetCaptainDialog';
+import { usePetCaptain } from './site-pet/usePetCaptain';
 
 type DragState = {
   pointerId: number;
@@ -91,7 +93,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   const [viewport, setViewport] = useState({ width: 1024, height: 768 });
   const [pos, setPos] = useState(() => ({ x: 0, y: 0 }));
   const [mood, setMood] = useState<PetMood>('idle');
-  const [message, setMessage] = useState('我在。暂时。');
+  const [message, setMessage] = useState('');
   const [bubbleVisible, setBubbleVisible] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [hidden, setHidden] = useState(false);
@@ -136,6 +138,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     setMenuOpen,
     setActionKey,
   });
+  const captain = usePetCaptain(ready, showBubble);
 
   const prepareMoodAsset = useCallback(async (nextMood: PetMood) => {
     const src = petActions[nextMood].src ?? PET_SHEET_SRC;
@@ -325,15 +328,19 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     void prepareMoodAsset(nextMood).then(loaded => {
       if (!loaded || cancelled || token !== transitionTokenRef.current) return;
       setPetBehavior(liveActive ? 'live' : 'idle', nextMood, { force: true });
-      showBubble(liveActive ? pick(liveLines) : '我在。暂时。');
       setMenuOpen(false);
     });
     return () => {
       cancelled = true;
     };
-  }, [liveActive, prepareMoodAsset, setPetBehavior, showBubble]);
+  }, [liveActive, prepareMoodAsset, setPetBehavior]);
 
   useEffect(() => {
+    if (captain.dialogOpen) {
+      dragRef.current = null;
+      returnToBaseBehavior(true);
+      return;
+    }
     const onPointerDown = (event: PointerEvent) => {
       if (hidden || event.button !== 0) return;
       const menu = menuRef.current;
@@ -449,9 +456,10 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       document.removeEventListener('contextmenu', onContextMenu);
       document.removeEventListener('click', onClick);
     };
-  }, [hidden, hitPet, liveActive, openMenuAtPet, prepareMoodAsset, returnToBaseBehavior, say, setPetBehavior, showGatherIdle]);
+  }, [captain.dialogOpen, hidden, hitPet, liveActive, openMenuAtPet, prepareMoodAsset, returnToBaseBehavior, say, setPetBehavior, showGatherIdle]);
 
   useEffect(() => {
+    if (captain.dialogOpen) return;
     const buffer: string[] = [];
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return;
@@ -461,7 +469,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [runPetAction]);
+  }, [captain.dialogOpen, runPetAction]);
 
   useEffect(() => () => {
     if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
@@ -547,6 +555,8 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       </div>
 
       <div
+        role="status"
+        aria-hidden={!ready || !bubbleVisible}
         className={`site-pet__bubble ${ready && bubbleVisible ? 'site-pet__bubble--visible' : ''}`}
         style={{
           left: Math.min(Math.max(12, pos.x - 38), Math.max(12, viewport.width - 244)),
@@ -555,6 +565,39 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       >
         {message}
       </div>
+
+      {ready && (
+        <button
+          type="button"
+          aria-label={captain.selectedCaptain ? '切换舰长' : '选择舰长'}
+          title={captain.selectedCaptain ? `当前舰长：${captain.selectedCaptain.name}，点击切换` : '选择舰长，记住你的排班'}
+          onPointerDown={event => event.stopPropagation()}
+          onClick={event => {
+            event.stopPropagation();
+            setMenuOpen(false);
+            captain.openDialog();
+          }}
+          className="pointer-events-auto fixed max-w-[160px] truncate rounded-full border border-[#E8B84B]/30 bg-[#0A0E14]/90 px-3 py-1 text-[11px] text-[#E8B84B] shadow-md hover:border-[#E8B84B]"
+          style={{
+            left: Math.min(Math.max(12, pos.x + petBoxSize.width / 2 - 60), Math.max(12, viewport.width - 172)),
+            top: Math.min(pos.y + petBoxSize.height + 4, viewport.height - 40),
+          }}
+        >
+          {captain.selectedCaptain ? `舰长：${captain.selectedCaptain.name}` : '你是哪位舰长？'}
+        </button>
+      )}
+
+      {captain.dialogOpen && (
+        <PetCaptainDialog
+          captains={captain.captains}
+          selectedId={captain.selectedCaptain?.id ?? null}
+          loading={captain.loading}
+          error={captain.error}
+          onSelect={captain.selectCaptain}
+          onClose={captain.closeDialog}
+          onRetry={captain.reload}
+        />
+      )}
 
       {menuOpen && (
         <div

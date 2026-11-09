@@ -34,3 +34,9 @@ export type PetActionDef = {
 
 export type IdleVariant = 'look' | 'sleepy';
 
+export type PetCaptain = {
+  id: number;
+  name: string;
+  nextDate: string | null;
+};
+
