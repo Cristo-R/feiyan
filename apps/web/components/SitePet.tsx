@@ -84,7 +84,6 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   const suppressClickRef = useRef<{ x: number; y: number; ts: number } | null>(null);
   const hideTimerRef = useRef<number | null>(null);
   const bubbleTimerRef = useRef<number | null>(null);
-  const sleepTimerRef = useRef<number | null>(null);
   const idleTimerRef = useRef<number | null>(null);
   const transitionTokenRef = useRef(0);
   const [ready, setReady] = useState(false);
@@ -126,13 +125,11 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     returnToBaseBehavior,
     say,
     showBubble,
-    resetSleepTimer,
   } = usePetBehavior({
     liveActive,
     dragRef,
     hideTimerRef,
     bubbleTimerRef,
-    sleepTimerRef,
     setMood,
     setMessage,
     setBubbleVisible,
@@ -194,15 +191,13 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
 
   const openMenuAtPet = useCallback(() => {
     setMenuOpen(true);
-    resetSleepTimer();
-  }, [resetSleepTimer]);
+  }, []);
 
   const runPetAction = useCallback(async (kind: 'pat' | 'tease' | 'scold' | 'glitch') => {
     if (liveActive) return;
     const token = ++transitionTokenRef.current;
     dragRef.current = null;
     setMenuOpen(false);
-    resetSleepTimer();
     if (!await prepareMoodAsset(kind) || token !== transitionTokenRef.current || liveActive) return;
     if (kind === 'pat') say('pat', pick(patLines), 4200, 'action', true);
     if (kind === 'tease') say('tease', pick(teaseLines), 2500, 'action', true);
@@ -212,7 +207,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       say('glitch', '完了，我好像多出来了。', 4200, 'glitch');
       window.setTimeout(() => setReplicas(0), 4200);
     }
-  }, [liveActive, prepareMoodAsset, resetSleepTimer, say]);
+  }, [liveActive, prepareMoodAsset, say]);
 
   const runMenuAction = useCallback((event: ReactPointerEvent<HTMLButtonElement>, kind: 'pat' | 'tease' | 'scold') => {
     event.preventDefault();
@@ -332,12 +327,11 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       setPetBehavior(liveActive ? 'live' : 'idle', nextMood, { force: true });
       showBubble(liveActive ? pick(liveLines) : '我在。暂时。');
       setMenuOpen(false);
-      resetSleepTimer();
     });
     return () => {
       cancelled = true;
     };
-  }, [liveActive, prepareMoodAsset, resetSleepTimer, setPetBehavior, showBubble]);
+  }, [liveActive, prepareMoodAsset, setPetBehavior, showBubble]);
 
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
@@ -354,7 +348,6 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       ++transitionTokenRef.current;
       suppressClickRef.current = { x: event.clientX, y: event.clientY, ts: Date.now() };
       if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
-      resetSleepTimer();
       setMenuOpen(false);
 
       dragRef.current = {
@@ -456,7 +449,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       document.removeEventListener('contextmenu', onContextMenu);
       document.removeEventListener('click', onClick);
     };
-  }, [hidden, hitPet, liveActive, openMenuAtPet, prepareMoodAsset, resetSleepTimer, returnToBaseBehavior, say, setPetBehavior, showGatherIdle]);
+  }, [hidden, hitPet, liveActive, openMenuAtPet, prepareMoodAsset, returnToBaseBehavior, say, setPetBehavior, showGatherIdle]);
 
   useEffect(() => {
     const buffer: string[] = [];
@@ -473,7 +466,6 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   useEffect(() => () => {
     if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
     if (bubbleTimerRef.current) window.clearTimeout(bubbleTimerRef.current);
-    if (sleepTimerRef.current) window.clearTimeout(sleepTimerRef.current);
     if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
   }, []);

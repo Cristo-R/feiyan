@@ -11,7 +11,6 @@ type UsePetBehaviorOptions = {
   dragRef: MutableRefObject<DragGuard | null>;
   hideTimerRef: MutableRefObject<number | null>;
   bubbleTimerRef: MutableRefObject<number | null>;
-  sleepTimerRef: MutableRefObject<number | null>;
   setMood: Dispatch<SetStateAction<PetMood>>;
   setMessage: Dispatch<SetStateAction<string>>;
   setBubbleVisible: Dispatch<SetStateAction<boolean>>;
@@ -34,7 +33,6 @@ export function usePetBehavior({
   dragRef,
   hideTimerRef,
   bubbleTimerRef,
-  sleepTimerRef,
   setMood,
   setMessage,
   setBubbleVisible,
@@ -92,23 +90,12 @@ export function usePetBehavior({
     }, duration);
   }, [hideTimerRef, returnToBaseBehavior, setPetBehavior, showBubble]);
 
-  const resetSleepTimer = useCallback(() => {
-    if (sleepTimerRef.current) window.clearTimeout(sleepTimerRef.current);
-    sleepTimerRef.current = window.setTimeout(() => {
-      if (!liveActive && setPetBehavior('sleep', 'sleep')) {
-        showBubble('我眯一会儿，有事再叫我。');
-        setMenuOpen(false);
-      }
-    }, 45000);
-  }, [liveActive, setMenuOpen, setPetBehavior, showBubble, sleepTimerRef]);
-
   return {
     behaviorRef,
     setPetBehavior,
     returnToBaseBehavior,
     say,
     showBubble,
-    resetSleepTimer,
   };
 }
 
