@@ -5,6 +5,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react';
 import {
   PET_SHEET_COLS,
   PET_SHEET_H,
+  PET_INTERACTION_ASSETS,
   PET_SHEET_ROWS,
   PET_SHEET_SRC,
   PET_SHEET_W,
@@ -13,9 +14,11 @@ import {
   moodFrames,
   petActions,
 } from './site-pet/petActions';
-import { dragLines, liveLines, patLines, pick, scoldLines, tapLines, teaseLines } from './site-pet/petLines';
+import { getPetAssetDisplayUrl, isPetAssetReady, loadPetAsset, warmPetAssets } from './site-pet/petAssetLoader';
+import { liveLines, patLines, pick, scoldLines, tapLines, teaseLines } from './site-pet/petLines';
 import type { DragPart, IdleVariant, PetFrame, PetMood } from './site-pet/petTypes';
 import { usePetBehavior } from './site-pet/usePetBehavior';
+import ContinuousPetCanvas from './site-pet/ContinuousPetCanvas';
 
 type DragState = {
   pointerId: number;
@@ -27,6 +30,7 @@ type DragState = {
   moved: boolean;
 };
 const EDGE_PAD = 12;
+const GATHER_IDLE_DELAY = 8000;
 
 function getPetSize() {
   if (typeof window === 'undefined') return 172;
@@ -51,13 +55,19 @@ function clampPosition(pos: { x: number; y: number }, box: number | { width: num
   };
 }
 
-function detectDragPart(clientX: number, clientY: number, rect: DOMRect): DragPart {
+function detectDragPart(clientX: number, clientY: number, rect: DOMRect, gathering: boolean): DragPart {
   const nx = (clientX - rect.left) / rect.width;
   const ny = (clientY - rect.top) / rect.height;
 
-  if (ny > 0.74) return 'leg';
-  if (ny < 0.39) return 'head';
-  if ((ny < 0.72 && (nx < 0.36 || nx > 0.64)) || (ny < 0.58 && nx < 0.53)) return 'hand';
+  if (gathering) {
+    if (ny > .76) return 'leg';
+    if (ny < .43) return 'head';
+    if (nx < .42 || nx > .58 || (ny < .64 && (nx < .49 || nx > .51))) return 'hand';
+    return 'body';
+  }
+  if (ny > .74) return 'leg';
+  if (ny < .39) return 'head';
+  if ((ny < .72 && (nx < .36 || nx > .64)) || (ny < .58 && nx < .53)) return 'hand';
   return 'body';
 }
 
@@ -66,6 +76,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   const menuRef = useRef<HTMLDivElement | null>(null);
   const alphaCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const alphaCanvasCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const rigHitTestRef = useRef<((x: number, y: number) => boolean) | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const rafRef = useRef<number | null>(null);
   const currentFrameRef = useRef<PetFrame>(moodFrames.idle);
@@ -75,19 +86,23 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   const bubbleTimerRef = useRef<number | null>(null);
   const sleepTimerRef = useRef<number | null>(null);
   const idleTimerRef = useRef<number | null>(null);
+  const transitionTokenRef = useRef(0);
   const [ready, setReady] = useState(false);
   const [size, setSize] = useState(getPetSize);
   const [viewport, setViewport] = useState({ width: 1024, height: 768 });
   const [pos, setPos] = useState(() => ({ x: 0, y: 0 }));
   const [mood, setMood] = useState<PetMood>('idle');
   const [message, setMessage] = useState('我在。暂时。');
-  const [bubbleVisible, setBubbleVisible] = useState(true);
+  const [bubbleVisible, setBubbleVisible] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [hidden, setHidden] = useState(false);
   const [actionKey, setActionKey] = useState(0);
   const [frameIndex, setFrameIndex] = useState(0);
   const [idleVariant, setIdleVariant] = useState<IdleVariant>('look');
   const [replicas, setReplicas] = useState(0);
+  const [gatherIdle, setGatherIdle] = useState(false);
+  const [gatherReady, setGatherReady] = useState(false);
+  const showGatherIdle = !liveActive && mood === 'idle' && gatherIdle && gatherReady;
 
   const moodClass = useMemo(() => `site-pet__sprite site-pet__sprite--${mood}`, [mood]);
   const action = mood === 'idle' ? idleActions[idleVariant] : petActions[mood];
@@ -110,6 +125,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     setPetBehavior,
     returnToBaseBehavior,
     say,
+    showBubble,
     resetSleepTimer,
   } = usePetBehavior({
     liveActive,
@@ -123,6 +139,19 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     setMenuOpen,
     setActionKey,
   });
+
+  const prepareMoodAsset = useCallback(async (nextMood: PetMood) => {
+    const src = petActions[nextMood].src ?? PET_SHEET_SRC;
+    try {
+      await loadPetAsset(src);
+      return true;
+    } catch (error) {
+      console.warn(error);
+      return false;
+    }
+  }, []);
+
+  const handleCanvasReady = useCallback(() => setGatherReady(true), []);
 
   useEffect(() => {
     moodRef.current = mood;
@@ -139,10 +168,13 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   const hitPet = useCallback((clientX: number, clientY: number) => {
     const box = petBoxRef.current;
     const canvas = alphaCanvasRef.current;
-    if (!box || !canvas || hidden) return false;
+    if (!box || hidden) return false;
 
     const rect = box.getBoundingClientRect();
-    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return false;
+    if (clientX < rect.left || clientX >= rect.right || clientY < rect.top || clientY >= rect.bottom) return false;
+
+    if (showGatherIdle) return rigHitTestRef.current?.((clientX - rect.left) / rect.width, (clientY - rect.top) / rect.height) ?? false;
+    if (!canvas) return false;
 
     // 快速路径：只检测边界框，避免昂贵的像素检测
     // 仅在必要时（如非矩形形状需要精确检测）才读取像素数据
@@ -158,18 +190,20 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const alpha = ctx?.getImageData(x, y, 1, 1).data[3] ?? 0;
     return alpha > 28;
-  }, [hidden]);
+  }, [hidden, showGatherIdle]);
 
   const openMenuAtPet = useCallback(() => {
     setMenuOpen(true);
     resetSleepTimer();
   }, [resetSleepTimer]);
 
-  const runPetAction = useCallback((kind: 'pat' | 'tease' | 'scold' | 'glitch') => {
+  const runPetAction = useCallback(async (kind: 'pat' | 'tease' | 'scold' | 'glitch') => {
     if (liveActive) return;
+    const token = ++transitionTokenRef.current;
     dragRef.current = null;
     setMenuOpen(false);
     resetSleepTimer();
+    if (!await prepareMoodAsset(kind) || token !== transitionTokenRef.current || liveActive) return;
     if (kind === 'pat') say('pat', pick(patLines), 4200, 'action', true);
     if (kind === 'tease') say('tease', pick(teaseLines), 2500, 'action', true);
     if (kind === 'scold') say('scold', pick(scoldLines), 3600, 'action', true);
@@ -178,12 +212,12 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       say('glitch', '完了，我好像多出来了。', 4200, 'glitch');
       window.setTimeout(() => setReplicas(0), 4200);
     }
-  }, [liveActive, resetSleepTimer, say]);
+  }, [liveActive, prepareMoodAsset, resetSleepTimer, say]);
 
   const runMenuAction = useCallback((event: ReactPointerEvent<HTMLButtonElement>, kind: 'pat' | 'tease' | 'scold') => {
     event.preventDefault();
     event.stopPropagation();
-    runPetAction(kind);
+    void runPetAction(kind);
   }, [runPetAction]);
 
   useEffect(() => {
@@ -217,10 +251,9 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       return;
     }
 
-    setReady(false);
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
+    let cancelled = false;
+    loadPetAsset(actionSrc).then(img => {
+      if (cancelled) return;
       const canvas = document.createElement('canvas');
       canvas.width = img.naturalWidth || PET_SHEET_W;
       canvas.height = img.naturalHeight || PET_SHEET_H;
@@ -229,9 +262,26 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       alphaCanvasCacheRef.current.set(actionSrc, canvas);
       alphaCanvasRef.current = canvas;
       setReady(true);
+    }).catch(error => {
+      console.warn(error);
+      if (!alphaCanvasRef.current) setReady(false);
+    });
+    return () => {
+      cancelled = true;
     };
-    img.src = actionSrc;
-  }, [actionSrc]);
+  }, [actionSrc, mood]);
+
+  useEffect(() => {
+    if (!ready) return;
+    void warmPetAssets(PET_INTERACTION_ASSETS, 2);
+  }, [ready]);
+
+  useEffect(() => {
+    setGatherIdle(false);
+    if (!ready || hidden || liveActive || mood !== 'idle') return;
+    const timer = window.setTimeout(() => setGatherIdle(true), GATHER_IDLE_DELAY);
+    return () => window.clearTimeout(timer);
+  }, [hidden, liveActive, mood, ready]);
 
   useEffect(() => {
     currentFrameRef.current = frame;
@@ -274,27 +324,34 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   }, [action.fps, action.frames.length, hidden, idleVariant, mood]);
 
   useEffect(() => {
-    setPetBehavior(liveActive ? 'live' : 'idle', liveActive ? 'live' : 'idle', { force: true });
-    setMessage(liveActive ? pick(liveLines) : '我在。暂时。');
-    setBubbleVisible(true);
-    setMenuOpen(false);
-    if (bubbleTimerRef.current) window.clearTimeout(bubbleTimerRef.current);
-    bubbleTimerRef.current = window.setTimeout(() => setBubbleVisible(false), 3200);
-    resetSleepTimer();
-  }, [liveActive, resetSleepTimer, setPetBehavior]);
+    let cancelled = false;
+    const token = ++transitionTokenRef.current;
+    const nextMood: PetMood = liveActive ? 'live' : 'idle';
+    void prepareMoodAsset(nextMood).then(loaded => {
+      if (!loaded || cancelled || token !== transitionTokenRef.current) return;
+      setPetBehavior(liveActive ? 'live' : 'idle', nextMood, { force: true });
+      showBubble(liveActive ? pick(liveLines) : '我在。暂时。');
+      setMenuOpen(false);
+      resetSleepTimer();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [liveActive, prepareMoodAsset, resetSleepTimer, setPetBehavior, showBubble]);
 
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
-      if (hidden) return;
+      if (hidden || event.button !== 0) return;
       const menu = menuRef.current;
       if (menu && event.target instanceof Node && menu.contains(event.target)) return;
       if (!hitPet(event.clientX, event.clientY)) return;
       const petRect = petBoxRef.current?.getBoundingClientRect();
       if (!petRect) return;
-      const part = detectDragPart(event.clientX, event.clientY, petRect);
+      const part = detectDragPart(event.clientX, event.clientY, petRect, showGatherIdle);
 
       event.preventDefault();
       event.stopPropagation();
+      ++transitionTokenRef.current;
       suppressClickRef.current = { x: event.clientX, y: event.clientY, ts: Date.now() };
       if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
       resetSleepTimer();
@@ -318,20 +375,22 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       const dy = event.clientY - drag.startY;
       if (!drag.moved && Math.hypot(dx, dy) > 5) {
         drag.moved = true;
+        setBubbleVisible(false);
         if (!liveActive) {
-          setPetBehavior('drag', dragMoodByPart[drag.part], {
-            message: pick(dragLines[drag.part]),
-            bubble: true,
+          const dragMood = dragMoodByPart[drag.part];
+          const beginDrag = () => setPetBehavior('drag', dragMood, {
+            bubble: false,
             force: true,
+          });
+          if (isPetAssetReady(petActions[dragMood].src ?? PET_SHEET_SRC)) beginDrag();
+          else void prepareMoodAsset(dragMood).then(loaded => {
+            if (loaded && dragRef.current === drag) beginDrag();
           });
         }
       }
       if (drag.moved) {
         event.preventDefault();
         setPos(clampPosition({ x: event.clientX - drag.offsetX, y: event.clientY - drag.offsetY }, petBoxSizeRef.current));
-        if (!liveActive && moodRef.current !== dragMoodByPart[drag.part]) {
-          setPetBehavior('drag', dragMoodByPart[drag.part], { force: true });
-        }
         if (liveActive && moodRef.current !== 'live') setPetBehavior('live', 'live', { force: true });
       }
     };
@@ -345,13 +404,18 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
         returnToBaseBehavior(true);
         return;
       }
-      if (drag.moved) {
+      if (drag.moved || event.type === 'pointercancel') {
         dragRef.current = null;
-        say('fall', '嘶……没事，我站起来了。', 1900, 'fall');
+        returnToBaseBehavior(true);
       } else {
         dragRef.current = null;
-        say('talk', pick(tapLines));
-        openMenuAtPet();
+        returnToBaseBehavior(true);
+        const token = ++transitionTokenRef.current;
+        void prepareMoodAsset('talk').then(loaded => {
+          if (!loaded || token !== transitionTokenRef.current || liveActive) return;
+          say('talk', pick(tapLines));
+          openMenuAtPet();
+        });
       }
     };
 
@@ -392,7 +456,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       document.removeEventListener('contextmenu', onContextMenu);
       document.removeEventListener('click', onClick);
     };
-  }, [hidden, hitPet, liveActive, openMenuAtPet, resetSleepTimer, returnToBaseBehavior, say, setPetBehavior]);
+  }, [hidden, hitPet, liveActive, openMenuAtPet, prepareMoodAsset, resetSleepTimer, returnToBaseBehavior, say, setPetBehavior, showGatherIdle]);
 
   useEffect(() => {
     const buffer: string[] = [];
@@ -441,6 +505,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
             top: pos.y + 8 + i * 10,
             width: size,
             animationDelay: `${i * 90}ms`,
+            backgroundImage: `url(${getPetAssetDisplayUrl(PET_SHEET_SRC)})`,
           }}
         />
       ))}
@@ -471,22 +536,26 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
         }}
         aria-hidden="true"
       >
-        <span
-          key={`${mood}-${actionKey}`}
-          aria-hidden="true"
-          className={moodClass}
-          style={{
-            backgroundImage: `url(${actionSrc})`,
-            backgroundPosition: framePosition,
-            backgroundSize: frameSize,
-            aspectRatio: actionAspectRatio,
-            height: '100%',
-          }}
-        />
+        {!showGatherIdle && (
+          <span
+            key={`${mood}-${actionKey}`}
+            aria-hidden="true"
+            data-asset-src={actionSrc}
+            className={moodClass}
+            style={{
+              backgroundImage: `url(${getPetAssetDisplayUrl(actionSrc)})`,
+              backgroundPosition: framePosition,
+              backgroundSize: frameSize,
+              aspectRatio: actionAspectRatio,
+              height: '100%',
+            }}
+          />
+        )}
+        {!liveActive && <ContinuousPetCanvas mood="idle" actionKey={0} visible={showGatherIdle} hitTestRef={rigHitTestRef} onReady={handleCanvasReady} />}
       </div>
 
       <div
-        className={`site-pet__bubble ${bubbleVisible ? 'site-pet__bubble--visible' : ''}`}
+        className={`site-pet__bubble ${ready && bubbleVisible ? 'site-pet__bubble--visible' : ''}`}
         style={{
           left: Math.min(Math.max(12, pos.x - 38), Math.max(12, viewport.width - 244)),
           top: Math.max(12, pos.y - 74),

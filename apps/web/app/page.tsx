@@ -30,7 +30,7 @@ export default function HomePage() {
   const [videoTotal, setVideoTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [petLivePreview, setPetLivePreview] = useState(false);
+  const [petLivePreview, setPetLivePreview] = useState<boolean | null>(null);
 
   const refreshLiveStatus = useCallback(async () => {
     try {
@@ -83,7 +83,8 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
-    setPetLivePreview(new URLSearchParams(window.location.search).get('petLive') === '1');
+    const preview = new URLSearchParams(window.location.search).get('petLive');
+    setPetLivePreview(preview === '1' ? true : preview === '0' ? false : null);
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
@@ -99,7 +100,7 @@ export default function HomePage() {
     const uid = userInfo?.mid || '14636839'; // 后备使用 .env.local 中的 BILIBILI_UID
     return `https://space.bilibili.com/${uid}`;
   }, [userInfo?.mid]);
-  const petLiveActive = live?.live_status === 1 || petLivePreview;
+  const petLiveActive = petLivePreview ?? (live?.live_status === 1);
   const heroSubtitle = (userInfo?.sign?.trim()) || cfg.defaultSign;
   const faceUrl = userInfo?.face || '/default-avatar.jpg';
   const displayNick = userInfo?.name || cfg.siteName;

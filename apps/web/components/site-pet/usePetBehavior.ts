@@ -66,6 +66,13 @@ export function usePetBehavior({
     setMenuOpen(false);
   }, [dragRef, liveActive, setMenuOpen, setMood]);
 
+  const showBubble = useCallback((nextMessage: string) => {
+    if (bubbleTimerRef.current) window.clearTimeout(bubbleTimerRef.current);
+    setMessage(nextMessage);
+    setBubbleVisible(true);
+    bubbleTimerRef.current = window.setTimeout(() => setBubbleVisible(false), 3200);
+  }, [bubbleTimerRef, setBubbleVisible, setMessage]);
+
   const say = useCallback((
     nextMood: PetMood,
     nextMessage: string,
@@ -74,43 +81,33 @@ export function usePetBehavior({
     force = false,
   ) => {
     if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
-    if (bubbleTimerRef.current) window.clearTimeout(bubbleTimerRef.current);
     if (!setPetBehavior(behavior, nextMood, {
-      message: nextMessage,
-      bubble: true,
       bumpAction: true,
       force: force || behavior === 'fall' || behavior === 'glitch',
     })) return;
-    bubbleTimerRef.current = window.setTimeout(() => {
-      setBubbleVisible(false);
-    }, Math.max(1800, duration - 500));
+    showBubble(nextMessage);
     hideTimerRef.current = window.setTimeout(() => {
       if (behaviorRef.current !== behavior) return;
       returnToBaseBehavior();
     }, duration);
-  }, [bubbleTimerRef, hideTimerRef, returnToBaseBehavior, setBubbleVisible, setPetBehavior]);
+  }, [hideTimerRef, returnToBaseBehavior, setPetBehavior, showBubble]);
 
   const resetSleepTimer = useCallback(() => {
     if (sleepTimerRef.current) window.clearTimeout(sleepTimerRef.current);
     sleepTimerRef.current = window.setTimeout(() => {
-      if (!liveActive) {
-        setPetBehavior('sleep', 'sleep', {
-          message: '我眯一会儿，有事再叫我。',
-          bubble: true,
-          force: behaviorRef.current === 'idle',
-        });
-        if (bubbleTimerRef.current) window.clearTimeout(bubbleTimerRef.current);
-        bubbleTimerRef.current = window.setTimeout(() => setBubbleVisible(false), 3200);
+      if (!liveActive && setPetBehavior('sleep', 'sleep')) {
+        showBubble('我眯一会儿，有事再叫我。');
         setMenuOpen(false);
       }
     }, 45000);
-  }, [bubbleTimerRef, liveActive, setBubbleVisible, setMenuOpen, setPetBehavior, sleepTimerRef]);
+  }, [liveActive, setMenuOpen, setPetBehavior, showBubble, sleepTimerRef]);
 
   return {
     behaviorRef,
     setPetBehavior,
     returnToBaseBehavior,
     say,
+    showBubble,
     resetSleepTimer,
   };
 }

@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { getLiveStatus } from '@/lib/bilibili';
 
+export const dynamic = 'force-dynamic';
+
 export async function GET() {
   try {
     const uid = process.env.BILIBILI_UID;
