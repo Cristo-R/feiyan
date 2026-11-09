@@ -1,9 +1,15 @@
 export function createEffects(back, front) {
   const ring = makeRingTexture();
+  for (const ctx of [back, front]) {
+    ctx.setTransform(ctx.canvas.width / 1024, 0, 0, ctx.canvas.height / 1024, 0, 0);
+  }
   return {
     draw(state, time, enabled = true) {
       drawEffects(back, false, state, time, ring, enabled);
       drawEffects(front, true, state, time, ring, enabled);
+    },
+    dispose() {
+      ring.width = ring.height = 0;
     },
   };
 }

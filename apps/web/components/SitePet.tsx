@@ -31,6 +31,7 @@ type DragState = {
   part: DragPart;
   moved: boolean;
 };
+type AlphaMask = { width: number; height: number; data: Uint8Array };
 const EDGE_PAD = 12;
 const GATHER_IDLE_DELAY = 8000;
 
@@ -77,11 +78,11 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   const petBoxRef = useRef<HTMLDivElement | null>(null);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const alphaCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const alphaCanvasCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const alphaMaskRef = useRef<AlphaMask | null>(null);
+  const alphaMaskCacheRef = useRef<Map<string, AlphaMask>>(new Map());
   const rigHitTestRef = useRef<((x: number, y: number) => boolean) | null>(null);
   const dragRef = useRef<DragState | null>(null);
-  const rafRef = useRef<number | null>(null);
+  const glitchTimerRef = useRef<number | null>(null);
   const currentFrameRef = useRef<PetFrame>(moodFrames.idle);
   const currentGridRef = useRef({ cols: PET_SHEET_COLS, rows: PET_SHEET_ROWS });
   const suppressClickRef = useRef<{ x: number; y: number; ts: number } | null>(null);
@@ -99,6 +100,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   const [bubbleHeight, setBubbleHeight] = useState(74);
   const [menuOpen, setMenuOpen] = useState(false);
   const [hidden, setHidden] = useState(false);
+  const [pageVisible, setPageVisible] = useState(true);
   const [actionKey, setActionKey] = useState(0);
   const [frameIndex, setFrameIndex] = useState(0);
   const [idleVariant, setIdleVariant] = useState<IdleVariant>('look');
@@ -173,29 +175,23 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
 
   const hitPet = useCallback((clientX: number, clientY: number) => {
     const box = petBoxRef.current;
-    const canvas = alphaCanvasRef.current;
+    const mask = alphaMaskRef.current;
     if (!box || hidden) return false;
 
     const rect = box.getBoundingClientRect();
     if (clientX < rect.left || clientX >= rect.right || clientY < rect.top || clientY >= rect.bottom) return false;
 
     if (showGatherIdle) return rigHitTestRef.current?.((clientX - rect.left) / rect.width, (clientY - rect.top) / rect.height) ?? false;
-    if (!canvas) return false;
+    if (!mask) return false;
 
-    // 快速路径：只检测边界框，避免昂贵的像素检测
-    // 仅在必要时（如非矩形形状需要精确检测）才读取像素数据
     const frame = currentFrameRef.current;
     const { cols, rows } = currentGridRef.current;
-    const cellW = canvas.width / cols;
-    const cellH = canvas.height / rows;
+    const cellW = mask.width / cols;
+    const cellH = mask.height / rows;
     const x = Math.floor(frame.col * cellW + ((clientX - rect.left) / rect.width) * cellW);
     const y = Math.floor(frame.row * cellH + ((clientY - rect.top) / rect.height) * cellH);
-    if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return false;
-
-    // 缓存 context 避免重复获取
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const alpha = ctx?.getImageData(x, y, 1, 1).data[3] ?? 0;
-    return alpha > 28;
+    if (x < 0 || y < 0 || x >= mask.width || y >= mask.height) return false;
+    return mask.data[y * mask.width + x] > 28;
   }, [hidden, showGatherIdle]);
 
   const openMenuAtPet = useCallback(() => {
@@ -212,9 +208,10 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     if (kind === 'tease') say('tease', pick(teaseLines), 2500, 'action', true);
     if (kind === 'scold') say('scold', pick(scoldLines), 3600, 'action', true);
     if (kind === 'glitch') {
+      if (glitchTimerRef.current) window.clearTimeout(glitchTimerRef.current);
       setReplicas(3);
       say('glitch', '完了，我好像多出来了。', 4200, 'glitch');
-      window.setTimeout(() => setReplicas(0), 4200);
+      glitchTimerRef.current = window.setTimeout(() => setReplicas(0), 4200);
     }
   }, [liveActive, prepareMoodAsset, say]);
 
@@ -248,9 +245,16 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   }, [petBoxSize.height, petBoxSize.width]);
 
   useEffect(() => {
-    const cached = alphaCanvasCacheRef.current.get(actionSrc);
+    const onVisibilityChange = () => setPageVisible(!document.hidden);
+    onVisibilityChange();
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
+  useEffect(() => {
+    const cached = alphaMaskCacheRef.current.get(actionSrc);
     if (cached) {
-      alphaCanvasRef.current = cached;
+      alphaMaskRef.current = cached;
       setReady(true);
       return;
     }
@@ -261,24 +265,29 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       const canvas = document.createElement('canvas');
       canvas.width = img.naturalWidth || PET_SHEET_W;
       canvas.height = img.naturalHeight || PET_SHEET_H;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      ctx?.drawImage(img, 0, 0);
-      alphaCanvasCacheRef.current.set(actionSrc, canvas);
-      alphaCanvasRef.current = canvas;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+      ctx.drawImage(img, 0, 0);
+      const rgba = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      const data = new Uint8Array(canvas.width * canvas.height);
+      for (let i = 0; i < data.length; i++) data[i] = rgba[i * 4 + 3];
+      const mask = { width: canvas.width, height: canvas.height, data };
+      canvas.width = canvas.height = 0;
+      alphaMaskCacheRef.current.set(actionSrc, mask);
+      alphaMaskRef.current = mask;
       setReady(true);
     }).catch(error => {
       console.warn(error);
-      if (!alphaCanvasRef.current) setReady(false);
+      if (!alphaMaskRef.current) setReady(false);
     });
     return () => {
       cancelled = true;
     };
-  }, [actionSrc, mood]);
+  }, [actionSrc]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || hidden || !pageVisible || liveActive) return;
     void warmPetAssets(PET_INTERACTION_ASSETS, 2);
-  }, [ready]);
+  }, [hidden, liveActive, pageVisible, ready]);
 
   useEffect(() => {
     setGatherIdle(false);
@@ -297,6 +306,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   }, [mood, actionKey, idleVariant]);
 
   useEffect(() => {
+    if (hidden || !pageVisible || showGatherIdle || action.frames.length <= 1) return;
     const interval = window.setInterval(() => {
       setFrameIndex(current => {
         if ((mood === 'idle' || action.loop === false) && current >= action.frames.length - 1) return current;
@@ -304,10 +314,10 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       });
     }, 1000 / Math.max(1, action.fps));
     return () => window.clearInterval(interval);
-  }, [action.fps, action.frames.length, action.loop, mood, actionKey, idleVariant]);
+  }, [action.fps, action.frames.length, action.loop, hidden, pageVisible, showGatherIdle, mood, actionKey, idleVariant]);
 
   useEffect(() => {
-    if (mood !== 'idle' || hidden) return;
+    if (mood !== 'idle' || hidden || !pageVisible || showGatherIdle) return;
 
     if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
     const actionDuration = (action.frames.length / action.fps) * 1000;
@@ -325,7 +335,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     return () => {
       if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
     };
-  }, [action.fps, action.frames.length, hidden, idleVariant, mood]);
+  }, [action.fps, action.frames.length, hidden, idleVariant, mood, pageVisible, showGatherIdle]);
 
   useEffect(() => {
     let cancelled = false;
@@ -481,7 +491,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
     if (bubbleTimerRef.current) window.clearTimeout(bubbleTimerRef.current);
     if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (glitchTimerRef.current) window.clearTimeout(glitchTimerRef.current);
   }, []);
 
   if (hidden) {
@@ -557,7 +567,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
             }}
           />
         )}
-        {!liveActive && <ContinuousPetCanvas mood="idle" actionKey={0} visible={showGatherIdle} hitTestRef={rigHitTestRef} onReady={handleCanvasReady} />}
+        {!liveActive && ready && <ContinuousPetCanvas mood="idle" actionKey={0} visible={showGatherIdle && pageVisible} hitTestRef={rigHitTestRef} onReady={handleCanvasReady} />}
       </div>
 
       <div

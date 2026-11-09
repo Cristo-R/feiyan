@@ -105,6 +105,7 @@ export function createCharacter(canvas, images) {
         if (layer.name === 'hand-left' || layer.name === 'hand-right') opacity *= 1 - gesture.relaxed;
         if (layer.name.startsWith('hand-relaxed')) opacity *= gesture.relaxed;
         if (layer.name === 'mouth-smile') opacity = gesture.smile;
+        if (opacity <= .001) continue;
         gl.uniform1f(uniforms.opacity, opacity);
         gl.uniform3f(uniforms.reach, ...(layer.side < 0 ? gesture.left : gesture.right));
         gl.uniform2f(uniforms.wrist, layer.side > 0 ? 1032 - WRIST[0] : WRIST[0], WRIST[1]);
@@ -120,6 +121,14 @@ export function createCharacter(canvas, images) {
     wristAt(raise, side) {
       const arc = Math.sin(Math.PI * raise);
       return [(side > 0 ? 1032 - mix(restWrist[0], WRIST[0], raise) : mix(restWrist[0], WRIST[0], raise)) + side * 64 * arc, mix(restWrist[1], WRIST[1], raise) - 20 * arc];
+    },
+    dispose() {
+      for (const layer of layers) {
+        gl.deleteTexture(layer.texture);
+        gl.deleteBuffer(layer.buffer);
+      }
+      gl.deleteProgram(program);
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
     },
   };
 }
@@ -196,6 +205,7 @@ function makeProgram(gl) {
     gl.compileShader(shader);
     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
     gl.attachShader(program, shader);
+    gl.deleteShader(shader);
   }
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));

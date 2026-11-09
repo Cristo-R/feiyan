@@ -13,6 +13,8 @@ type Pose = { raise: number; close: number; lift: number; energy: number; seat: 
 type Gesture = typeof REST_GESTURE;
 
 const IDLE: Pose = { raise: 1, close: 1, lift: 1, energy: 1, seat: 1, sleeve: 1 };
+const CANVAS_SIZE = 512;
+const FRAME_INTERVAL = 1000 / 30;
 const ACTION_LENGTH: Record<string, number> = { pat: 4.2, tease: 2.5, scold: 3.6, fall: 2.1, sleep: 5.2, dragHead: 2.4, dragHand: 2.4, dragLeg: 2.4, dragBody: 2.4, talk: 1.5 };
 
 function smooth(a: number, b: number, value: number) {
@@ -75,9 +77,9 @@ export default function ContinuousPetCanvas({ mood, actionKey, dragVisual = null
   const frontRef = useRef<HTMLCanvasElement>(null);
   const moodRef = useRef(mood);
   const dragVisualRef = useRef<DragVisual>(dragVisual);
-  const rendererRef = useRef<any>(null);
-  const effectsRef = useRef<any>(null);
   const rafRef = useRef<number>();
+  const visibleRef = useRef(visible);
+  const syncRenderingRef = useRef<(() => void) | null>(null);
   const startedRef = useRef(performance.now());
   const previousRef = useRef(performance.now());
   const sleeveRef = useRef(1);
@@ -86,23 +88,31 @@ export default function ContinuousPetCanvas({ mood, actionKey, dragVisual = null
   useEffect(() => { moodRef.current = mood; startedRef.current = performance.now(); }, [mood]);
   useEffect(() => { startedRef.current = performance.now(); }, [actionKey]);
   useEffect(() => { dragVisualRef.current = dragVisual; }, [dragVisual]);
+  useEffect(() => {
+    visibleRef.current = visible;
+    syncRenderingRef.current?.();
+  }, [visible]);
 
   useEffect(() => {
     let cancelled = false;
+    let dispose = () => {};
     void (async () => {
-      const images = await loadAssets({ interactions: true });
+      const images = await loadAssets();
       if (cancelled || !characterRef.current || !backRef.current || !frontRef.current) return;
-      rendererRef.current = createCharacter(characterRef.current, images);
-      effectsRef.current = createEffects(backRef.current.getContext('2d')!, frontRef.current.getContext('2d')!);
-      const gl = characterRef.current.getContext('webgl')!;
+      const character = characterRef.current;
+      const back = backRef.current;
+      const front = frontRef.current;
+      const renderer = createCharacter(character, images);
+      const effects = createEffects(back.getContext('2d')!, front.getContext('2d')!);
+      const gl = character.getContext('webgl')!;
       const pixel = new Uint8Array(4);
       let redraw = () => {};
       hitTestRef.current = (x, y) => {
         redraw();
-        gl.readPixels(Math.floor(x * 1024), 1023 - Math.floor(y * 1024), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+        gl.readPixels(Math.floor(x * gl.drawingBufferWidth), gl.drawingBufferHeight - 1 - Math.floor(y * gl.drawingBufferHeight), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
         return pixel[3] > 28;
       };
-      const animate = (now: number) => {
+      const drawFrame = (now: number) => {
         const elapsed = Math.min((now - previousRef.current) / 1000, .1);
         previousRef.current = now;
         const currentMood = moodRef.current;
@@ -142,21 +152,52 @@ export default function ContinuousPetCanvas({ mood, actionKey, dragVisual = null
         }
         current.pose.sleeve = sleeveRef.current;
         const effectTime = currentMood === 'idle' ? now / 1000 : elapsedAction * 2;
-        effectsRef.current.draw(current.pose, effectTime, currentMood !== 'talk');
-        redraw = () => rendererRef.current.draw(current.pose, effectTime, current.gesture);
+        effects.draw(current.pose, effectTime, currentMood !== 'talk');
+        redraw = () => renderer.draw(current.pose, effectTime, current.gesture);
         redraw();
+      };
+      let lastFrame = 0;
+      const animate = (now: number) => {
+        if (now - lastFrame >= FRAME_INTERVAL - 1) {
+          lastFrame = now;
+          drawFrame(now);
+        }
         rafRef.current = requestAnimationFrame(animate);
       };
-      previousRef.current = performance.now();
-      rafRef.current = requestAnimationFrame(animate);
+      const stop = () => {
+        if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current);
+        rafRef.current = undefined;
+      };
+      const syncRendering = () => {
+        stop();
+        if (!visibleRef.current) return;
+        previousRef.current = performance.now();
+        lastFrame = 0;
+        rafRef.current = requestAnimationFrame(animate);
+      };
+      syncRenderingRef.current = syncRendering;
+      dispose = () => {
+        stop();
+        renderer.dispose();
+        effects.dispose();
+        character.width = character.height = 0;
+        back.width = back.height = 0;
+        front.width = front.height = 0;
+      };
+      syncRendering();
       onReady();
     })().catch(error => console.error('Continuous pet failed to initialize', error));
-    return () => { cancelled = true; hitTestRef.current = null; if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+    return () => {
+      cancelled = true;
+      hitTestRef.current = null;
+      syncRenderingRef.current = null;
+      dispose();
+    };
   }, [hitTestRef, onReady]);
 
   return <span className="site-pet__rig" style={{ visibility: visible ? 'visible' : 'hidden' }} aria-hidden="true">
-    <canvas ref={backRef} width={1024} height={1024} />
-    <canvas ref={characterRef} width={1024} height={1024} />
-    <canvas ref={frontRef} width={1024} height={1024} />
+    <canvas ref={backRef} width={CANVAS_SIZE} height={CANVAS_SIZE} />
+    <canvas ref={characterRef} width={CANVAS_SIZE} height={CANVAS_SIZE} />
+    <canvas ref={frontRef} width={CANVAS_SIZE} height={CANVAS_SIZE} />
   </span>;
 }
