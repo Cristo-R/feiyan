@@ -26,7 +26,6 @@ export default function PetCaptainDialog({ captains, selectedId, loading, error,
     <dialog
       ref={dialogRef}
       aria-labelledby="pet-captain-title"
-      aria-describedby="pet-captain-description"
       onCancel={onClose}
       className="pointer-events-auto m-auto max-h-[80dvh] w-[min(92vw,420px)] rounded-2xl border border-gray-200 bg-white p-5 text-[#333] shadow-2xl backdrop:bg-black/45"
     >
@@ -34,7 +33,6 @@ export default function PetCaptainDialog({ captains, selectedId, loading, error,
         <h2 id="pet-captain-title" className="text-lg font-semibold">舰长大人，该怎么称呼您呀？</h2>
         <button type="button" aria-label="关闭舰长选择" onClick={onClose} className="rounded-lg px-2 py-1 text-xl text-gray-500 hover:bg-gray-100">×</button>
       </div>
-      <p id="pet-captain-description" className="mt-2 text-sm leading-relaxed text-gray-500">劳烦您选一下，小的好记住您，下次见面先给您报排班。身份只记在当前浏览器，随时可以换。</p>
       <label htmlFor="pet-captain-search" className="sr-only">搜索舰长名称</label>
       <input
         id="pet-captain-search"
