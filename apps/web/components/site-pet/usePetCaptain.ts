@@ -43,9 +43,9 @@ export function usePetCaptain(ready: boolean, showBubble: (message: string, dura
     greetedRef.current = true;
     const captain = captains.find(item => item.id === selectedId);
     if (error) {
-      showBubble('舰长，欢迎来玩！排班暂时没查到，稍后再试试。', 8000);
+      showBubble('舰长大人恕罪，排班暂时没查出来，劳烦您稍后再试一下……', 8000);
     } else {
-      showBubble(captain ? captainGreeting(captain, true) : '舰长，你是哪一位？选一下，下次我就记得你啦。', 8000);
+      showBubble(captain ? captainGreeting(captain, true) : '舰长大人，您来啦……恕小的眼拙，能告诉小的该怎么称呼您吗？', 8000);
     }
     if (!captain && (!error || selectedId === null)) {
       askTimerRef.current = window.setTimeout(openDialog, 1400);
@@ -66,7 +66,7 @@ export function usePetCaptain(ready: boolean, showBubble: (message: string, dura
     setSelectedId(captain.id);
     setDialogOpen(false);
     showBubble(captainGreeting(captain, false)
-      + (remembered ? '' : ' 浏览器未能保存身份，下次需要重新选择。'), 10000);
+      + (remembered ? '' : ' 小的没能在浏览器里记住您，下次还得劳烦您再选一下……'), 10000);
   }, [showBubble]);
 
   return {
@@ -92,8 +92,8 @@ function readCaptainId(): number | null {
 }
 
 function captainGreeting(captain: PetCaptain, returning: boolean) {
-  const welcome = returning ? `欢迎回来，${captain.name}舰长！` : `${captain.name}舰长，认出你啦！`;
-  if (!captain.nextDate) return `${welcome}目前还没有你的排班，有安排了再告诉你。`;
+  const welcome = returning ? `${captain.name}舰长大人，您回来啦～` : `${captain.name}舰长大人，小的记住您了～`;
+  if (!captain.nextDate) return `${welcome}小的看过了，暂时还没有您的排班。您先歇着，有事尽管吩咐。`;
   const [year, month, day] = captain.nextDate.split('-');
-  return `${welcome}你最近一次排班在 ${year}年${Number(month)}月${Number(day)}日，记得来哦。`;
+  return `${welcome}小的查过了，${year}年${Number(month)}月${Number(day)}日有您的排班。到时候赏脸来一下呀。`;
 }

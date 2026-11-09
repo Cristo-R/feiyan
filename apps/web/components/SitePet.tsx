@@ -75,6 +75,7 @@ function detectDragPart(clientX: number, clientY: number, rect: DOMRect, gatheri
 
 export default function SitePet({ liveActive = false }: { liveActive?: boolean }) {
   const petBoxRef = useRef<HTMLDivElement | null>(null);
+  const bubbleRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const alphaCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const alphaCanvasCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
@@ -95,6 +96,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
   const [mood, setMood] = useState<PetMood>('idle');
   const [message, setMessage] = useState('');
   const [bubbleVisible, setBubbleVisible] = useState(false);
+  const [bubbleHeight, setBubbleHeight] = useState(74);
   const [menuOpen, setMenuOpen] = useState(false);
   const [hidden, setHidden] = useState(false);
   const [actionKey, setActionKey] = useState(0);
@@ -139,6 +141,10 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
     setActionKey,
   });
   const captain = usePetCaptain(ready, showBubble);
+
+  useEffect(() => {
+    if (bubbleRef.current) setBubbleHeight(bubbleRef.current.offsetHeight);
+  }, [hidden, message]);
 
   const prepareMoodAsset = useCallback(async (nextMood: PetMood) => {
     const src = petActions[nextMood].src ?? PET_SHEET_SRC;
@@ -555,12 +561,13 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
       </div>
 
       <div
+        ref={bubbleRef}
         role="status"
         aria-hidden={!ready || !bubbleVisible}
         className={`site-pet__bubble ${ready && bubbleVisible ? 'site-pet__bubble--visible' : ''}`}
         style={{
           left: Math.min(Math.max(12, pos.x - 38), Math.max(12, viewport.width - 244)),
-          top: Math.max(12, pos.y - 74),
+          top: Math.max(12, pos.y - bubbleHeight - 12),
         }}
       >
         {message}
@@ -583,7 +590,7 @@ export default function SitePet({ liveActive = false }: { liveActive?: boolean }
             top: Math.min(pos.y + petBoxSize.height + 4, viewport.height - 40),
           }}
         >
-          {captain.selectedCaptain ? `舰长：${captain.selectedCaptain.name}` : '你是哪位舰长？'}
+          {captain.selectedCaptain ? `${captain.selectedCaptain.name}大人` : '舰长大人怎么称呼？'}
         </button>
       )}
 
